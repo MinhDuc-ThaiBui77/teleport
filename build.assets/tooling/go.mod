@@ -18,7 +18,7 @@ require (
 	github.com/gravitational/trace v1.5.4
 	github.com/stretchr/testify v1.11.1
 	github.com/waigani/diffparser v0.0.0-20190828052634-7391f219313d
-	golang.org/x/mod v0.36.0
+	golang.org/x/mod v0.37.0
 	golang.org/x/oauth2 v0.36.0
 	golang.org/x/tools v0.45.0
 	google.golang.org/protobuf v1.36.11
