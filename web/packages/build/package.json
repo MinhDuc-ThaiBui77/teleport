@@ -1,0 +1,30 @@
+{
+  "name": "@gravitational/build",
+  "version": "1.0.1",
+  "description": "build scripts",
+  "main": "index.js",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/gravitational/webapps/webapps.git",
+    "directory": "packages/build"
+  },
+  "dependencies": {
+    "@babel/core": "^7.29.7",
+    "@babel/preset-env": "^7.29.7",
+    "@babel/preset-react": "^7.29.7",
+    "@babel/preset-typescript": "^7.29.7",
+    "@swc/core": "^1.15.40",
+    "@swc/plugin-styled-components": "^12.10.0",
+    "@types/jsdom": "^28.0.3",
+    "@vitejs/plugin-react-swc": "^4.3.1",
+    "babel-plugin-styled-components": "^2.3.0",
+    "globals": "^17.6.0",
+    "jest-environment-jsdom": "^30.4.1",
+    "jest-fail-on-console": "^3.3.4",
+    "jsdom": "^29.1.1",
+    "rollup-plugin-visualizer": "^7.0.1",
+    "vite-plugin-compression2": "^2.5.3",
+    "vite-plugin-wasm": "^3.6.0"
+  }
+}

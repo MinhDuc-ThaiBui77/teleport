@@ -1,0 +1,966 @@
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+package fetchers
+
+import (
+	"cmp"
+	"context"
+	"encoding/base64"
+	"fmt"
+	"log/slog"
+	"path"
+	"slices"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/arn"
+	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
+	"github.com/aws/aws-sdk-go-v2/service/eks"
+	ekstypes "github.com/aws/aws-sdk-go-v2/service/eks/types"
+	"github.com/aws/aws-sdk-go-v2/service/iam"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
+	"github.com/gravitational/trace"
+	"github.com/jonboulle/clockwork"
+	"golang.org/x/sync/errgroup"
+	rbacv1 "k8s.io/api/rbac/v1"
+	kubeerrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/yaml"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+
+	"github.com/gravitational/teleport"
+	"github.com/gravitational/teleport/api/types"
+	awslib "github.com/gravitational/teleport/lib/cloud/aws"
+	awsregions "github.com/gravitational/teleport/lib/cloud/aws/regions"
+	"github.com/gravitational/teleport/lib/cloud/awsconfig"
+	"github.com/gravitational/teleport/lib/fixtures"
+	kubeutils "github.com/gravitational/teleport/lib/kube/utils"
+	"github.com/gravitational/teleport/lib/services"
+	"github.com/gravitational/teleport/lib/srv/discovery/common"
+)
+
+const (
+	concurrencyLimit = 5
+)
+
+type eksFetcher struct {
+	EKSFetcherConfig
+}
+
+// regionalFetcher discovers EKS clusters in a single AWS region.
+type regionalFetcher struct {
+	matcher    types.AWSMatcher
+	logger     *slog.Logger
+	eks        EKSClient
+	stsPresign STSPresignClient
+	// principalARN is the IAM role access will be provisioned for
+	principalARN string
+	// bootstrapARN is the IAM role the fetcher will use to temporarily
+	// setup admin access, which it uses to provision long term access
+	// to the principalARN
+	bootstrapARN string
+}
+
+// EKSClient is the subset of the EKS interface we use in fetchers.
+type EKSClient interface {
+	eks.DescribeClusterAPIClient
+	eks.ListClustersAPIClient
+
+	AssociateAccessPolicy(ctx context.Context, params *eks.AssociateAccessPolicyInput, optFns ...func(*eks.Options)) (*eks.AssociateAccessPolicyOutput, error)
+	CreateAccessEntry(ctx context.Context, params *eks.CreateAccessEntryInput, optFns ...func(*eks.Options)) (*eks.CreateAccessEntryOutput, error)
+	DeleteAccessEntry(ctx context.Context, params *eks.DeleteAccessEntryInput, optFns ...func(*eks.Options)) (*eks.DeleteAccessEntryOutput, error)
+	DescribeAccessEntry(ctx context.Context, params *eks.DescribeAccessEntryInput, optFns ...func(*eks.Options)) (*eks.DescribeAccessEntryOutput, error)
+	UpdateAccessEntry(ctx context.Context, params *eks.UpdateAccessEntryInput, optFns ...func(*eks.Options)) (*eks.UpdateAccessEntryOutput, error)
+}
+
+// STSClient is the subset of the STS interface we use in fetchers.
+type STSClient interface {
+	GetCallerIdentity(ctx context.Context, params *sts.GetCallerIdentityInput, optFns ...func(*sts.Options)) (*sts.GetCallerIdentityOutput, error)
+	stscreds.AssumeRoleAPIClient
+}
+
+// STSPresignClient is the subset of the STS presign interface we use in fetchers.
+type STSPresignClient = kubeutils.STSPresignClient
+
+// IAMClient is the subset of the IAM interface we use in fetchers.
+type IAMClient interface {
+	GetRole(ctx context.Context, params *iam.GetRoleInput, optFns ...func(*iam.Options)) (*iam.GetRoleOutput, error)
+}
+
+// AWSClientGetter is an interface for getting an EKS client and an STS client.
+type AWSClientGetter interface {
+	awsconfig.Provider
+	// GetAWSEKSClient returns AWS EKS client for the specified config.
+	GetAWSEKSClient(aws.Config) EKSClient
+	// GetAWSSTSClient returns AWS STS client for the specified config.
+	GetAWSSTSClient(aws.Config) STSClient
+	// GetAWSSTSPresignClient returns AWS STS presign client for the specified config.
+	GetAWSSTSPresignClient(aws.Config) STSPresignClient
+	// GetAWSIAMClient returns AWS IAM client for the specified config.
+	GetAWSIAMClient(aws.Config) IAMClient
+}
+
+// EKSFetcherConfig configures the EKS fetcher.
+type EKSFetcherConfig struct {
+	// ClientGetter retrieves an EKS client and an STS client.
+	ClientGetter AWSClientGetter
+	// Matcher is the AWS matcher with discovery rules: regions, tags,
+	// integration, assume role, access setup.
+	Matcher types.AWSMatcher
+	// RegionsListerGetter lists AWS regions enabled for the caller's account.
+	// Required to expand the wildcard region.
+	RegionsListerGetter awsregions.ListerGetter
+	// DiscoveryConfigName is the name of the discovery config which originated the resource.
+	// Might be empty when the fetcher is using static matchers:
+	// ie teleport.yaml/discovery_service.<cloud>.<matcher>
+	DiscoveryConfigName string
+	// Logger is the logger.
+	Logger *slog.Logger
+}
+
+// CheckAndSetDefaults validates and sets the defaults values.
+func (c *EKSFetcherConfig) CheckAndSetDefaults() error {
+	if c.ClientGetter == nil {
+		return trace.BadParameter("missing ClientGetter field")
+	}
+	if len(c.Matcher.Regions) == 0 {
+		return trace.BadParameter("missing Matcher.Regions field")
+	}
+	if c.Matcher.IsRegionWildcard() && c.RegionsListerGetter == nil {
+		return trace.BadParameter("missing RegionsListerGetter field for wildcard region matcher")
+	}
+	if len(c.Matcher.Tags) == 0 {
+		return trace.BadParameter("missing Matcher.Tags field")
+	}
+
+	if c.Logger == nil {
+		c.Logger = slog.With(teleport.ComponentKey, "fetcher:eks")
+	}
+
+	return nil
+}
+
+// MakeEKSFetchersFromAWSMatchers creates fetchers from the provided matchers.
+// Emits one fetcher per matcher. Wildcard regions are expanded at fetch time.
+func MakeEKSFetchersFromAWSMatchers(
+	logger *slog.Logger,
+	clients AWSClientGetter,
+	regionsListerGetter awsregions.ListerGetter,
+	matchers []types.AWSMatcher,
+	discoveryConfigName string,
+) ([]common.Fetcher, error) {
+	var kubeFetchers []common.Fetcher
+	for _, matcher := range matchers {
+		if !slices.Contains(matcher.Types, types.AWSMatcherEKS) {
+			continue
+		}
+		fetcher, err := NewEKSFetcher(EKSFetcherConfig{
+			ClientGetter:        clients,
+			Matcher:             matcher,
+			RegionsListerGetter: regionsListerGetter,
+			Logger:              logger,
+			DiscoveryConfigName: discoveryConfigName,
+		})
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+		kubeFetchers = append(kubeFetchers, fetcher)
+	}
+	return kubeFetchers, nil
+}
+
+// NewEKSFetcher creates a new EKS fetcher configuration.
+func NewEKSFetcher(cfg EKSFetcherConfig) (common.Fetcher, error) {
+	if err := cfg.CheckAndSetDefaults(); err != nil {
+		return nil, trace.Wrap(err)
+	}
+	return &eksFetcher{EKSFetcherConfig: cfg}, nil
+}
+
+func (a *eksFetcher) credentialOpts() []awsconfig.OptionsFn {
+	var assumeRole types.AssumeRole
+	if a.Matcher.AssumeRole != nil {
+		assumeRole = *a.Matcher.AssumeRole
+	}
+	return getAWSOpts(assumeRole, a.Matcher.Integration)
+}
+
+// resolveAccessRoles returns the principal and bootstrap ARNs for this matcher.
+// principalARN is Matcher.SetupAccessForARN, falling back to bootstrapARN.
+// bootstrapARN is Matcher.AssumeRole, falling back to sts:GetCallerIdentity.
+// Either may be empty when STS fails and the relevant matcher field is unset.
+func (a *eksFetcher) resolveAccessRoles(ctx context.Context, regions []string) (principalARN, bootstrapARN string) {
+	if a.Matcher.AssumeRole != nil && a.Matcher.AssumeRole.RoleARN != "" {
+		bootstrapARN = a.Matcher.AssumeRole.RoleARN
+	} else {
+		bootstrapARN = a.getCallerIdentityARN(ctx, regions)
+	}
+	return cmp.Or(a.Matcher.SetupAccessForARN, bootstrapARN), bootstrapARN
+}
+
+// getCallerIdentityARN calls sts:GetCallerIdentity through any region whose
+// config initializes successfully.
+func (a *eksFetcher) getCallerIdentityARN(ctx context.Context, regions []string) string {
+	for _, region := range regions {
+		cfg, err := a.ClientGetter.GetConfig(ctx, region, a.credentialOpts()...)
+		if err != nil {
+			a.Logger.WarnContext(ctx, "Failed to initialize AWS config for STS",
+				"region", region, "error", err)
+			continue
+		}
+		out, err := a.ClientGetter.GetAWSSTSClient(cfg).GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{})
+		if err != nil {
+			a.Logger.WarnContext(ctx, "Failed to resolve AWS caller identity, EKS access bootstrap will be skipped this cycle", "error", err)
+			return ""
+		}
+		iamARN, err := resolveIAMRoleARN(ctx, a.ClientGetter.GetAWSIAMClient(cfg), aws.ToString(out.Arn))
+		if err != nil {
+			a.Logger.WarnContext(ctx, "Failed to parse AWS caller identity ARN, EKS access bootstrap will be skipped this cycle", "error", err)
+			return ""
+		}
+		return iamARN
+	}
+	return ""
+}
+
+// GetIntegration returns the integration name that is used for getting credentials of the fetcher.
+func (a *eksFetcher) GetIntegration() string {
+	return a.Matcher.Integration
+}
+
+type DiscoveredEKSCluster struct {
+	types.KubeCluster
+
+	Integration            string
+	EnableKubeAppDiscovery bool
+}
+
+func (d *DiscoveredEKSCluster) GetIntegration() string {
+	return d.Integration
+}
+
+func (d *DiscoveredEKSCluster) GetKubeAppDiscovery() bool {
+	return d.EnableKubeAppDiscovery
+}
+
+func (d *DiscoveredEKSCluster) GetKubeCluster() types.KubeCluster {
+	return d.KubeCluster
+}
+
+func (a *eksFetcher) Get(ctx context.Context) (types.ResourcesWithLabels, error) {
+	clusters, err := a.getEKSClusters(ctx)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	resources := make(types.ResourcesWithLabels, 0, len(clusters))
+	for _, cluster := range clusters {
+		common.ApplyEKSNameSuffix(cluster)
+		resources = append(resources, &DiscoveredEKSCluster{
+			KubeCluster:            cluster,
+			Integration:            a.Matcher.Integration,
+			EnableKubeAppDiscovery: a.Matcher.KubeAppDiscovery,
+		})
+	}
+	return resources, nil
+}
+
+func (a *eksFetcher) getEKSClusters(ctx context.Context) (types.KubeClusters, error) {
+	regions := a.Matcher.Regions
+	if a.Matcher.IsRegionWildcard() {
+		enabled, err := awsregions.ListEnabledRegions(ctx, a.RegionsListerGetter, a.credentialOpts()...)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+		regions = enabled
+	}
+	if len(regions) == 0 {
+		return nil, trace.Errorf("account:ListRegions returned no enabled regions")
+	}
+
+	var principalARN, bootstrapARN string
+	if a.Matcher.Integration == "" {
+		principalARN, bootstrapARN = a.resolveAccessRoles(ctx, regions)
+	}
+
+	var clusters types.KubeClusters
+	for _, region := range regions {
+		rf, err := a.newRegionalFetcher(ctx, region, principalARN, bootstrapARN)
+		if err != nil {
+			a.Logger.WarnContext(ctx, "Failed to initialize regional EKS fetcher, skipping",
+				"region", region, "error", err)
+			continue
+		}
+		regionClusters, err := rf.FindClusters(ctx)
+		if err != nil {
+			a.Logger.WarnContext(ctx, "Failed to discover EKS clusters in region, skipping",
+				"region", region, "error", err)
+			continue
+		}
+		clusters = append(clusters, regionClusters...)
+	}
+	return clusters, nil
+}
+
+func (a *eksFetcher) newRegionalFetcher(ctx context.Context, region, principalARN, bootstrapARN string) (*regionalFetcher, error) {
+	cfg, err := a.ClientGetter.GetConfig(ctx, region, a.credentialOpts()...)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	return &regionalFetcher{
+		matcher:      a.Matcher,
+		logger:       a.Logger,
+		eks:          a.ClientGetter.GetAWSEKSClient(cfg),
+		stsPresign:   a.ClientGetter.GetAWSSTSPresignClient(cfg),
+		principalARN: principalARN,
+		bootstrapARN: bootstrapARN,
+	}, nil
+}
+
+// FindClusters lists EKS clusters in this region, filters them against the
+// matcher, and sets up access entries where required. Per-cluster errors are
+// logged and swallowed so one bad cluster cannot abort the region.
+func (r *regionalFetcher) FindClusters(ctx context.Context) (types.KubeClusters, error) {
+	var (
+		clusters        types.KubeClusters
+		mu              sync.Mutex
+		group, groupCtx = errgroup.WithContext(ctx)
+	)
+	group.SetLimit(concurrencyLimit)
+
+	// For now we should only list EKS clusters so we use nil (default) input param.
+	for p := eks.NewListClustersPaginator(r.eks, nil); p.HasMorePages(); {
+		out, err := p.NextPage(ctx)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+		for _, clusterName := range out.Clusters {
+			// group.Go will block if the concurrency limit is reached.
+			// It will resume once any running function finishes.
+			group.Go(func() error {
+				cluster, err := r.getMatchingKubeCluster(groupCtx, clusterName)
+				// trace.CompareFailed is returned if the cluster did not match the matcher filtering labels
+				// or if the cluster is not yet active.
+				if trace.IsCompareFailed(err) {
+					r.logger.DebugContext(groupCtx, "Cluster did not match the filtering criteria", "error", err, "cluster", clusterName)
+					return nil
+				} else if err != nil {
+					r.logger.WarnContext(groupCtx, "Failed to discover EKS cluster", "error", err, "cluster", clusterName)
+					return nil
+				}
+
+				mu.Lock()
+				defer mu.Unlock()
+				clusters = append(clusters, cluster)
+				return nil
+			})
+		}
+	}
+
+	// The error can be discarded since we do not return any error from group.Go closure.
+	_ = group.Wait()
+	return clusters, nil
+}
+
+func (a *eksFetcher) ResourceType() string {
+	return types.KindKubernetesCluster
+}
+
+func (a *eksFetcher) FetcherType() string {
+	return types.AWSMatcherEKS
+}
+
+func (a *eksFetcher) Cloud() string {
+	return types.CloudAWS
+}
+
+func (a *eksFetcher) IntegrationName() string {
+	return a.Matcher.Integration
+}
+
+func (a *eksFetcher) GetDiscoveryConfigName() string {
+	return a.DiscoveryConfigName
+}
+
+func (a *eksFetcher) String() string {
+	return fmt.Sprintf("eksFetcher(Regions=%v, FilterLabels=%v)",
+		a.Matcher.Regions, a.Matcher.Tags)
+}
+
+// getMatchingKubeCluster extracts EKS cluster Tags and cluster status from EKS and checks if the cluster matches
+// the AWS matcher filtering labels. It also excludes EKS clusters that are not ready.
+// If any cluster does not match the filtering criteria, this function returns a “trace.CompareFailed“ error
+// to distinguish filtering and operational errors.
+func (r *regionalFetcher) getMatchingKubeCluster(ctx context.Context, clusterName string) (types.KubeCluster, error) {
+	rsp, err := r.eks.DescribeCluster(
+		ctx,
+		&eks.DescribeClusterInput{
+			Name: aws.String(clusterName),
+		},
+	)
+	if err != nil {
+		return nil, trace.WrapWithMessage(err, "Unable to describe EKS cluster %q", clusterName)
+	}
+
+	switch st := rsp.Cluster.Status; st {
+	case ekstypes.ClusterStatusUpdating, ekstypes.ClusterStatusActive:
+		r.logger.DebugContext(ctx, "EKS cluster status is valid", "status", st, "cluster", clusterName)
+	default:
+		return nil, trace.CompareFailed("EKS cluster %q not enrolled due to its current status: %s", clusterName, st)
+	}
+
+	cluster, err := common.NewKubeClusterFromAWSEKS(aws.ToString(rsp.Cluster.Name), aws.ToString(rsp.Cluster.Arn), rsp.Cluster.Tags)
+	if err != nil {
+		return nil, trace.WrapWithMessage(err, "Unable to convert eks.Cluster cluster into types.KubernetesClusterV3.")
+	}
+
+	if match, reason, err := services.MatchLabels(r.matcher.Tags, cluster.GetAllLabels()); err != nil {
+		return nil, trace.WrapWithMessage(err, "Unable to match EKS cluster labels against match labels.")
+	} else if !match {
+		return nil, trace.CompareFailed("EKS cluster %q labels does not match the selector: %s", clusterName, reason)
+	}
+
+	// When a principal role arn couldn't be resolved, or we can't inspect the existing
+	// Access configuration, there's no reason to attempt access setup. This will be
+	// retried next cycle, so if the pre-reqs resolve successfully access will be provisioned.
+	if r.principalARN == "" || rsp.Cluster.AccessConfig == nil {
+		return cluster, nil
+	}
+
+	var assumedRole *types.AssumeRole
+	if r.matcher.AssumeRole != nil && r.matcher.AssumeRole.RoleARN != "" {
+		assumedRole = r.matcher.AssumeRole
+	}
+
+	// Set the AWS status for the cluster. This holds information about the
+	// access setup that was performed for discovering this cluster.
+	// This information is later used during deletion when the cluster no longer
+	// matches the filtering criteria in order to clean up any access that was set up.
+	cluster.SetStatus(
+		&types.KubernetesClusterStatus{
+			Discovery: &types.KubernetesClusterDiscoveryStatus{
+				Aws: &types.KubernetesClusterAWSStatus{
+					SetupAccessForArn:    r.principalARN,
+					Integration:          r.matcher.Integration,
+					DiscoveryAssumedRole: assumedRole,
+				},
+			},
+		},
+	)
+
+	// If the fetcher should setup access for the specified ARN, first check if the cluster authentication mode
+	// is set to either [eks.AuthenticationModeApi] or [eks.AuthenticationModeApiAndConfigMap].
+	// If the authentication mode is set to [eks.AuthenticationModeConfigMap], the fetcher will ignore the cluster.
+	switch st := rsp.Cluster.AccessConfig.AuthenticationMode; st {
+	case ekstypes.AuthenticationModeApiAndConfigMap, ekstypes.AuthenticationModeApi:
+		if err := r.checkOrSetupAccessForARN(ctx, rsp.Cluster); err != nil {
+			return nil, trace.Wrap(err, "unable to setup access for EKS cluster %q", clusterName)
+		}
+		return cluster, nil
+	default:
+		r.logger.InfoContext(ctx, "EKS cluster must be configured manually due to its authentication mode",
+			"cluster", clusterName,
+			"authentication_mode", st,
+			"access_arn", r.principalARN,
+		)
+		return cluster, nil
+	}
+}
+
+const (
+	// teleportKubernetesGroup is the Kubernetes group that exists in the EKS cluster and is used to grant access to the cluster
+	// for the specified ARN.
+	teleportKubernetesGroup = "teleport:kube-service:eks"
+)
+
+// eksDiscoveryPermissions is used for logging to list all the permissions that
+// the discovery service may need to discover EKS clusters and configure access.
+var eksDiscoveryPermissions = []string{
+	"eks:AssociateAccessPolicy",
+	"eks:CreateAccessEntry",
+	"eks:DeleteAccessEntry",
+	"eks:DescribeAccessEntry",
+	"eks:DescribeCluster",
+	"eks:ListClusters",
+	"eks:TagResource",
+	"eks:UpdateAccessEntry",
+}
+
+// checkOrSetupAccessForARN checks if the ARN has access to the cluster and sets up the access if needed.
+// The check involves checking if the access entry exists and if the "teleport:kube-service:eks" is part of the Kubernetes group.
+// If the access entry doesn't exist or is misconfigured, the fetcher will temporarily gain admin access and create the role and binding.
+// The fetcher will then upsert the access entry with the correct Kubernetes group.
+func (r *regionalFetcher) checkOrSetupAccessForARN(ctx context.Context, cluster *ekstypes.Cluster) error {
+	entry, err := convertAWSError(
+		r.eks.DescribeAccessEntry(ctx,
+			&eks.DescribeAccessEntryInput{
+				ClusterName:  cluster.Name,
+				PrincipalArn: aws.String(r.principalARN),
+			},
+		),
+	)
+
+	switch {
+	case trace.IsAccessDenied(err):
+		// Access denied means that the principal does not have access to setup access entries for the cluster.
+		r.logger.WarnContext(ctx, "Access denied to setup access for EKS cluster, ensure the required permissions are set",
+			"error", err,
+			"cluster", aws.ToString(cluster.Name),
+			"required_permissions", eksDiscoveryPermissions,
+		)
+		return nil
+	case err == nil:
+		// If the access entry exists and the principal has access to the cluster, check if the teleportKubernetesGroup is part of the Kubernetes group.
+		if entry.AccessEntry != nil && slices.Contains(entry.AccessEntry.KubernetesGroups, teleportKubernetesGroup) {
+			return nil
+		}
+		fallthrough
+	case trace.IsNotFound(err):
+		// Entry missing or misconfigured: temporarily gain admin access to install
+		// the role and binding. Skip when bootstrapARN is unresolved and retry next
+		// cycle, leaving status intact so cleanup metadata is preserved.
+		if r.bootstrapARN == "" {
+			r.logger.WarnContext(ctx, "Skipping EKS access setup because bootstrap identity is unresolved, will retry next discovery cycle",
+				"cluster", aws.ToString(cluster.Name),
+				"principal_arn", r.principalARN,
+			)
+			return nil
+		}
+		if err := r.temporarilyGainAdminAccessAndCreateRole(ctx, cluster); trace.IsAccessDenied(err) {
+			// Access denied means that the principal does not have access to setup access entries for the cluster.
+			r.logger.WarnContext(ctx, "Access denied to setup access for EKS cluster, ensure the required permissions are set",
+				"error", err,
+				"cluster", aws.ToString(cluster.Name),
+				"required_permissions", eksDiscoveryPermissions,
+			)
+			return nil
+		} else if err != nil {
+			return trace.Wrap(err, "unable to setup access for EKS cluster %q", aws.ToString(cluster.Name))
+		}
+
+		// upsert the access entry with the correct Kubernetes group for the final
+		err = r.upsertAccessEntry(ctx, cluster)
+		if trace.IsAccessDenied(err) {
+			// Access denied means that the principal does not have access to setup access entries for the cluster.
+			r.logger.WarnContext(ctx, "Access denied to setup access for EKS cluster, ensure the required permissions are set",
+				"error", err,
+				"cluster", aws.ToString(cluster.Name),
+				"required_permissions", eksDiscoveryPermissions,
+			)
+			return nil
+		}
+		return trace.Wrap(err, "unable to setup access for EKS cluster %q", aws.ToString(cluster.Name))
+	default:
+		return trace.Wrap(err)
+	}
+}
+
+// temporarilyGainAdminAccessAndCreateRole temporarily gains admin access to the EKS cluster by associating the EKS Cluster Admin Policy
+// to the bootstrap ARN. The fetcher will then create the role and binding for the teleportKubernetesGroup in the EKS cluster.
+func (r *regionalFetcher) temporarilyGainAdminAccessAndCreateRole(ctx context.Context, cluster *ekstypes.Cluster) error {
+	const (
+		// https://docs.aws.amazon.com/eks/latest/userguide/access-policies.html
+		// We use cluster admin policy to create namespace and cluster role.
+		eksClusterAdminPolicy = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"
+	)
+
+	// Setup access for the ARN
+	rsp, err := convertAWSError(
+		r.eks.CreateAccessEntry(ctx,
+			&eks.CreateAccessEntryInput{
+				ClusterName:  cluster.Name,
+				PrincipalArn: aws.String(r.bootstrapARN),
+			},
+		),
+	)
+	if err != nil && !trace.IsAlreadyExists(err) {
+		return trace.Wrap(err)
+	}
+
+	// rsp is not nil when the access entry was created and needs to be deleted after the role and binding are created.
+	if rsp != nil {
+		defer func() {
+			_, err := convertAWSError(
+				r.eks.DeleteAccessEntry(
+					ctx,
+					&eks.DeleteAccessEntryInput{
+						ClusterName:  cluster.Name,
+						PrincipalArn: aws.String(r.bootstrapARN),
+					}),
+			)
+			if err != nil {
+				r.logger.WarnContext(ctx, "Failed to delete access entry for EKS cluster",
+					"error", err,
+					"cluster", aws.ToString(cluster.Name),
+				)
+			}
+		}()
+	}
+
+	_, err = convertAWSError(
+		r.eks.AssociateAccessPolicy(ctx, &eks.AssociateAccessPolicyInput{
+			AccessScope: &ekstypes.AccessScope{
+				Namespaces: nil,
+				Type:       ekstypes.AccessScopeTypeCluster,
+			},
+			ClusterName:  cluster.Name,
+			PolicyArn:    aws.String(eksClusterAdminPolicy),
+			PrincipalArn: aws.String(r.bootstrapARN),
+		}),
+	)
+	if err != nil && !trace.IsAlreadyExists(err) {
+		return trace.Wrap(err, "unable to associate EKS Access Policy to cluster %q", aws.ToString(cluster.Name))
+	}
+
+	timeout := time.NewTimer(60 * time.Second)
+	defer timeout.Stop()
+forLoop:
+	for {
+
+		// EKS Access Entries are eventually consistent, so we need to wait for the access to be granted.
+		// AWS API recommends to wait for 5 seconds before checking the access.
+		err = r.upsertRoleAndBinding(ctx, cluster)
+		if err == nil || !kubeerrors.IsForbidden(err) && !kubeerrors.IsUnauthorized(err) {
+			break
+		}
+		select {
+		case <-timeout.C:
+			break forLoop
+		case <-time.After(5 * time.Second):
+
+		}
+
+	}
+	return trace.Wrap(err, "unable to upsert role and binding for cluster %q", aws.ToString(cluster.Name))
+}
+
+// upsertRoleAndBinding upserts the ClusterRole and ClusterRoleBinding for the teleportKubernetesGroup in the EKS cluster.
+func (r *regionalFetcher) upsertRoleAndBinding(ctx context.Context, cluster *ekstypes.Cluster) error {
+	client, err := r.createKubeClient(ctx, cluster)
+	if err != nil {
+		return trace.Wrap(err, "unable to create Kubernetes client for cluster %q", aws.ToString(cluster.Name))
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+
+	if err := r.upsertClusterRoleWithAdminCredentials(ctx, client); err != nil {
+		return trace.Wrap(err, "unable to upsert ClusterRole for group %q", teleportKubernetesGroup)
+	}
+
+	if err := r.upsertClusterRoleBindingWithAdminCredentials(ctx, client, teleportKubernetesGroup); err != nil {
+		return trace.Wrap(err, "unable to upsert ClusterRoleBinding for group %q", teleportKubernetesGroup)
+	}
+
+	return nil
+}
+
+func (r *regionalFetcher) createKubeClient(ctx context.Context, cluster *ekstypes.Cluster) (*kubernetes.Clientset, error) {
+	if r.stsPresign == nil {
+		return nil, trace.BadParameter("STS presign client is not set")
+	}
+	token, _, err := kubeutils.GenAWSEKSToken(ctx, r.stsPresign, aws.ToString(cluster.Name), clockwork.NewRealClock())
+	if err != nil {
+		return nil, trace.Wrap(err, "unable to generate EKS token for cluster %q", aws.ToString(cluster.Name))
+	}
+
+	ca, err := base64.StdEncoding.DecodeString(aws.ToString(cluster.CertificateAuthority.Data))
+	if err != nil {
+		return nil, trace.Wrap(err, "unable to decode EKS cluster %q certificate authority", aws.ToString(cluster.Name))
+	}
+
+	apiEndpoint := aws.ToString(cluster.Endpoint)
+	if len(apiEndpoint) == 0 {
+		return nil, trace.BadParameter("invalid api endpoint for cluster %q", aws.ToString(cluster.Name))
+	}
+
+	client, err := kubernetes.NewForConfig(
+		&rest.Config{
+			Host:        apiEndpoint,
+			BearerToken: token,
+			TLSClientConfig: rest.TLSClientConfig{
+				CAData: ca,
+			},
+		},
+	)
+	return client, trace.Wrap(err, "unable to create Kubernetes client for cluster %q", aws.ToString(cluster.Name))
+}
+
+// upsertClusterRoleWithAdminCredentials tries to upsert the ClusterRole using admin credentials.
+func (r *regionalFetcher) upsertClusterRoleWithAdminCredentials(ctx context.Context, client *kubernetes.Clientset) error {
+	clusterRole := &rbacv1.ClusterRole{}
+
+	if err := yaml.Unmarshal([]byte(fixtures.KubeClusterRoleTemplate), clusterRole); err != nil {
+		return trace.Wrap(err)
+	}
+
+	_, err := client.RbacV1().ClusterRoles().Create(ctx, clusterRole, metav1.CreateOptions{})
+	if err == nil {
+		return nil
+	}
+
+	if kubeerrors.IsAlreadyExists(err) {
+		_, err := client.RbacV1().ClusterRoles().Update(ctx, clusterRole, metav1.UpdateOptions{})
+		return trace.Wrap(err)
+	}
+
+	return trace.Wrap(err)
+}
+
+// upsertClusterRoleBindingWithAdminCredentials tries to upsert the ClusterRoleBinding using admin credentials
+// and maps it into the principal group.
+func (r *regionalFetcher) upsertClusterRoleBindingWithAdminCredentials(ctx context.Context, client *kubernetes.Clientset, groupID string) error {
+	clusterRoleBinding := &rbacv1.ClusterRoleBinding{}
+
+	if err := yaml.Unmarshal([]byte(fixtures.KubeClusterRoleBindingTemplate), clusterRoleBinding); err != nil {
+		return trace.Wrap(err)
+	}
+
+	if len(clusterRoleBinding.Subjects) == 0 {
+		return trace.BadParameter("Subjects field were not correctly unmarshaled")
+	}
+
+	clusterRoleBinding.Subjects[0].Name = groupID
+
+	_, err := client.RbacV1().ClusterRoleBindings().Create(ctx, clusterRoleBinding, metav1.CreateOptions{})
+	if err == nil {
+		return nil
+	}
+
+	if kubeerrors.IsAlreadyExists(err) {
+		_, err := client.RbacV1().ClusterRoleBindings().Update(ctx, clusterRoleBinding, metav1.UpdateOptions{})
+		return trace.Wrap(err)
+	}
+
+	return trace.Wrap(err)
+}
+
+// upsertAccessEntry upserts the access entry for the specified ARN with the teleportKubernetesGroup.
+func (r *regionalFetcher) upsertAccessEntry(ctx context.Context, cluster *ekstypes.Cluster) error {
+	_, err := convertAWSError(
+		r.eks.CreateAccessEntry(ctx,
+			&eks.CreateAccessEntryInput{
+				ClusterName:      cluster.Name,
+				PrincipalArn:     aws.String(r.principalARN),
+				KubernetesGroups: []string{teleportKubernetesGroup},
+			},
+		))
+	if err == nil || !trace.IsAlreadyExists(err) {
+		return trace.Wrap(err)
+	}
+
+	_, err = convertAWSError(
+		r.eks.UpdateAccessEntry(ctx,
+			&eks.UpdateAccessEntryInput{
+				ClusterName:      cluster.Name,
+				PrincipalArn:     aws.String(r.principalARN),
+				KubernetesGroups: []string{teleportKubernetesGroup},
+			},
+		))
+
+	return trace.Wrap(err)
+}
+
+// resolveIAMRoleARN converts an STS caller identity ARN to the corresponding IAM role ARN.
+// For assumed-role ARNs it calls iam:GetRole to retrieve the exact ARN (including any path),
+// which is required for SSO roles that include a region in their path
+// (e.g. /aws-reserved/sso.amazonaws.com/us-west-2/). Falls back to string conversion on error.
+func resolveIAMRoleARN(ctx context.Context, iamClient IAMClient, callerARN string) (string, error) {
+	parsed, err := arn.Parse(callerARN)
+	if err != nil || !strings.HasPrefix(parsed.Resource, "assumed-role/") {
+		return callerARN, nil
+	}
+	parts := strings.SplitN(parsed.Resource, "/", 3)
+	if len(parts) < 2 {
+		return callerARN, nil
+	}
+	roleName := parts[1]
+	if iamClient == nil {
+		return convertAssumedRoleToIAMRole(callerARN), nil
+	}
+	resp, err := iamClient.GetRole(ctx, &iam.GetRoleInput{RoleName: aws.String(roleName)})
+	if err != nil {
+		// Fall back to best-effort string conversion rather than failing entirely.
+		return convertAssumedRoleToIAMRole(callerARN), nil
+	}
+	return aws.ToString(resp.Role.Arn), nil
+}
+
+func getAWSOpts(assumeRole types.AssumeRole, integration string) []awsconfig.OptionsFn {
+	return []awsconfig.OptionsFn{
+		awsconfig.WithAssumeRole(
+			assumeRole.RoleARN,
+			assumeRole.ExternalID,
+		),
+		awsconfig.WithCredentialsMaybeIntegration(awsconfig.IntegrationMetadata{Name: integration}),
+	}
+}
+
+func convertAWSError[T any](rsp T, err error) (T, error) {
+	err = awslib.ConvertRequestFailureError(err)
+	return rsp, trace.Wrap(err)
+}
+
+// convertAssumedRoleToIAMRole converts the assumed role ARN to an IAM role ARN.
+// The assumed role ARN is in the format "arn:aws:sts::account-id:assumed-role/role-name/role-session-name".
+// The IAM role ARN is in the format "arn:aws:iam::account-id:role/role-name".
+// Note: this does not handle roles with non-default paths (e.g. AWS SSO roles); use resolveIAMRoleARN instead.
+func convertAssumedRoleToIAMRole(callerIdentity string) string {
+	const (
+		assumeRolePrefix = "assumed-role/"
+		roleResource     = "role"
+		serviceName      = "iam"
+	)
+	a, err := arn.Parse(callerIdentity)
+	if err != nil {
+		return callerIdentity
+	}
+	if !strings.HasPrefix(a.Resource, assumeRolePrefix) {
+		return callerIdentity
+	}
+	a.Service = serviceName
+	split := strings.Split(a.Resource, "/")
+	if len(split) <= 2 {
+		return callerIdentity
+	}
+	a.Resource = path.Join(roleResource, split[1])
+	return a.String()
+}
+
+// DeleteKubernetesDanglingResourcesConfig configures the deletion of dangling Kubernetes resources
+// created during EKS cluster discovery. This configuration is used to clean up AWS resources that
+// were automatically provisioned when a cluster was discovered but are no longer needed (e.g., when
+// the cluster is deleted or no longer matches discovery filters).
+//
+// Dangling resources include:
+//   - EKS Access Entries: IAM principal-to-Kubernetes group mappings created for Teleport access
+//
+// The cleanup process is idempotent and safe to run multiple times. It will skip non-EKS clusters
+// and clusters without AWS discovery status.
+type DeleteKubernetesDanglingResourcesConfig struct {
+	// ClientGetter retrieves an EKS client and an STS client for making AWS API calls.
+	// This must be configured with appropriate credentials to delete access entries.
+	ClientGetter AWSClientGetter
+
+	// Cluster is the Kubernetes cluster resource to clean up dangling AWS resources for.
+	// The cluster's status must contain AWS discovery metadata (SetupAccessForARN, Integration, AssumedRole)
+	// for cleanup to proceed. If the cluster is not an EKS cluster or lacks AWS status, cleanup is skipped.
+	Cluster types.KubeCluster
+
+	// Logger is used for logging cleanup operations and errors.
+	Logger *slog.Logger
+}
+
+// CheckAndSetDefaults validates the configuration and sets default values for optional fields.
+// It ensures that required fields (ClientGetter, Cluster) are provided and initializes the
+// Logger with a default component key if not already set.
+//
+// Returns:
+//   - trace.BadParameter if required fields are missing
+//   - nil if validation succeeds
+func (c *DeleteKubernetesDanglingResourcesConfig) CheckAndSetDefaults() error {
+	if c.ClientGetter == nil {
+		return trace.BadParameter("missing ClientGetter field")
+	}
+	if c.Cluster == nil {
+		return trace.BadParameter("missing Cluster field")
+	}
+
+	if c.Logger == nil {
+		return trace.BadParameter("missing Logger field")
+	}
+
+	return nil
+}
+
+// DeleteKubernetesDanglingResources deletes dangling AWS resources that were automatically created
+// during EKS cluster discovery. This function should be called when a cluster is being removed or
+// no longer matches discovery criteria to ensure proper cleanup of AWS access configurations.
+//
+// Cleanup Process:
+//  1. Retrieves AWS credentials using the same role/integration used during cluster discovery
+//  2. Checks if the access entry exists for the principal ARN specified in cluster status
+//  3. Deletes the access entry if it exists
+func DeleteKubernetesDanglingResources(ctx context.Context, cfg DeleteKubernetesDanglingResourcesConfig) error {
+	if err := cfg.CheckAndSetDefaults(); err != nil {
+		return trace.Wrap(err)
+	}
+
+	cluster := cfg.Cluster
+
+	// Early return: Skip cleanup if the cluster is not an EKS cluster or lacks AWS discovery status.
+	// This is expected for non-AWS clusters or clusters discovered without AWS integration.
+	if !cluster.IsAWS() || cluster.GetStatus() == nil || cluster.GetStatus().Discovery == nil || cluster.GetStatus().Discovery.Aws == nil {
+		return nil
+	}
+
+	// Extract cluster configuration and AWS status information.
+	// This metadata was populated during cluster discovery and tells us:
+	// - Which AWS region and account the cluster is in
+	// - Which IAM role was assumed during discovery (if any)
+	// - Which integration was used for authentication
+	// - Which principal ARN had access configured
+	region := cluster.GetAWSConfig().Region
+	clusterName := cluster.GetAWSConfig().Name
+	awsStatus := cluster.GetStatus().Discovery.Aws
+
+	// Reconstruct the AWS configuration used during cluster discovery.
+	// This ensures we use the same credentials/role/integration for cleanup.
+	assumeRole := types.AssumeRole{}
+	if awsStatus.DiscoveryAssumedRole != nil {
+		assumeRole = *awsStatus.DiscoveryAssumedRole
+	}
+
+	awsConfig, err := cfg.ClientGetter.GetConfig(ctx, region, getAWSOpts(assumeRole, awsStatus.Integration)...)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
+	client := cfg.ClientGetter.GetAWSEKSClient(awsConfig)
+
+	// Access entry exists and needs to be deleted.
+	cfg.Logger.InfoContext(ctx, "Deleting dangling access entry for EKS cluster",
+		"cluster_name", clusterName,
+		"region", region,
+		"aws_account_id", cluster.GetAWSConfig().AccountID,
+		"principal_arn", awsStatus.SetupAccessForArn,
+	)
+
+	_, err = convertAWSError(
+		client.DeleteAccessEntry(ctx, &eks.DeleteAccessEntryInput{
+			ClusterName:  aws.String(clusterName),
+			PrincipalArn: aws.String(awsStatus.SetupAccessForArn),
+		}),
+	)
+
+	switch {
+	case trace.IsNotFound(err):
+		// Access entry doesn't exist - already cleaned up or never created.
+		// This is a successful outcome; nothing more to do.
+		return nil
+	case trace.IsAccessDenied(err):
+		// Access denied means that the principal does not have access to delete access entries for the cluster.
+		return trace.Wrap(err, "access denied when attempting to delete access entry for cluster %q. Ensure the required permissions are set", clusterName)
+	default:
+		return trace.Wrap(err, "failed to delete access entry for cluster %q", clusterName)
+	}
+}

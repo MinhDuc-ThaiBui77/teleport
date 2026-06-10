@@ -1,0 +1,33 @@
+# Per-server access role — clone this file ONCE PER TARGET SERVER.
+#
+# Naming convention: ssh-access-<server-id>   (e.g. ssh-access-web1)
+#
+# Key idea: the user does NOT hold this role normally. They REQUEST it via
+# the GUI/CLI, and it is granted only after approval, for a limited time
+# (max_session_ttl). This is how we emulate "request access to one server"
+# using the OSS-available "request access to a role" feature.
+kind: role
+version: v7
+metadata:
+  name: ssh-access-web1
+  description: "SSH access to server 'web1' (granted via access request only)"
+spec:
+  allow:
+    # Which OS logins are allowed on the target host. Adjust per your servers.
+    logins: ['ubuntu']
+
+    # Target EXACTLY the one server that carries this label.
+    # On that server's teleport.yaml set a UNIQUE label, e.g.:
+    #   ssh_service:
+    #     labels:
+    #       access-id: web1
+    node_labels:
+      access-id: 'web1'
+
+  options:
+    # Time-limited window once the role is assumed (your "controlled time" need).
+    max_session_ttl: 4h
+
+# NOTE for OSS: do NOT add allow.request.search_as_roles, allow.request.thresholds,
+# or allow.review_requests anywhere — all three are enterprise-gated and will be
+# rejected at `tctl create` time on a Community build.

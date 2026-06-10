@@ -1,0 +1,17 @@
+# Assigned to ADMINS / APPROVERS.
+#
+# OSS-safe approval path:  tctl requests approve <request-id>
+# That command calls SetAccessRequestState (RBAC verb 'update' below), which is
+# NOT enterprise-gated. We deliberately do NOT use the enterprise review flow
+# (tsh request review / allow.review_requests), which IS gated.
+kind: role
+version: v7
+metadata:
+  name: ssh-approver
+  description: "Can approve/deny SSH access requests (OSS-safe, via tctl)"
+spec:
+  allow:
+    rules:
+      - resources: [access_request]
+        # 'update' = approve/deny via SetAccessRequestState.
+        verbs: [list, read, update]

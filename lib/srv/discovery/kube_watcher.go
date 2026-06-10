@@ -1,0 +1,185 @@
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+package discovery
+
+import (
+	"context"
+	"sync"
+
+	"github.com/gravitational/trace"
+
+	usageeventsv1 "github.com/gravitational/teleport/api/gen/proto/go/usageevents/v1"
+	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/lib/services"
+	"github.com/gravitational/teleport/lib/srv/discovery/common"
+	"github.com/gravitational/teleport/lib/srv/discovery/fetchers"
+	"github.com/gravitational/teleport/lib/utils"
+)
+
+const kubeEventPrefix = "kube/"
+
+func (s *Server) startKubeWatchers() error {
+	if len(s.getKubeNonIntegrationFetchers()) == 0 && s.DiscoveryGroup == "" {
+		return nil
+	}
+
+	var (
+		kubeResources []types.KubeCluster
+		mu            sync.Mutex
+	)
+
+	reconciler, err := services.NewReconciler(
+		services.ReconcilerConfig[types.KubeCluster]{
+			Matcher: func(_ types.KubeCluster) bool { return true },
+			GetCurrentResources: func() map[string]types.KubeCluster {
+				kcs, err := s.AccessPoint.GetKubernetesClusters(s.ctx)
+				if err != nil {
+					s.Log.WarnContext(s.ctx, "Unable to get Kubernetes clusters from cache", "error", err)
+					return nil
+				}
+
+				return utils.FromSlice(filterResources(kcs, types.OriginCloud, s.DiscoveryGroup), types.KubeCluster.GetName)
+			},
+			GetNewResources: func() map[string]types.KubeCluster {
+				mu.Lock()
+				defer mu.Unlock()
+				return utils.FromSlice(kubeResources, types.KubeCluster.GetName)
+			},
+			CompareResources: func(kc1, kc2 types.KubeCluster) int {
+				if !kc1.IsEqual(kc2) {
+					return services.Different
+				}
+				// Additionally compare Status field using its IsEqual method.
+				// This is needed because CompareResources ignores Status field of KubeCluster and for most
+				// usages of KubeCluster that is acceptable. However, in this context we want to consider Status changes
+				// as significant changes that require reconciliation so we can update resources discovered before this
+				// feature was implemented.
+				if kc1.GetStatus().IsEqual(kc2.GetStatus()) {
+					return services.Equal
+				}
+				return services.Different
+			},
+			Logger:   s.Log.With("kind", types.KindKubernetesCluster),
+			OnCreate: s.onKubeCreate,
+			OnUpdate: s.onKubeUpdate,
+			OnDelete: s.onKubeDelete,
+		},
+	)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
+	watcher, err := common.NewWatcher(s.ctx, common.WatcherConfig{
+		FetchersFn: func() []common.Fetcher {
+			kubeNonIntegrationFetchers := s.getKubeNonIntegrationFetchers()
+			s.submitFetchersEvent(kubeNonIntegrationFetchers)
+			return kubeNonIntegrationFetchers
+		},
+		Logger:         s.Log.With("kind", types.KindKubernetesCluster),
+		DiscoveryGroup: s.DiscoveryGroup,
+		Interval:       s.PollInterval,
+		Origin:         types.OriginCloud,
+		Clock:          s.clock,
+	})
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	go watcher.Start()
+
+	go func() {
+		for {
+			select {
+			case newResources := <-watcher.ResourcesC():
+				clusters := make([]types.KubeCluster, 0, len(newResources))
+				for _, r := range newResources {
+					if cluster, ok := r.(types.DiscoveredEKSCluster); ok {
+						clusters = append(clusters, cluster.GetKubeCluster())
+						continue
+					}
+					if cluster, ok := r.(types.KubeCluster); ok {
+						clusters = append(clusters, cluster)
+						continue
+					}
+				}
+				mu.Lock()
+				kubeResources = clusters
+				mu.Unlock()
+
+				if err := reconciler.Reconcile(s.ctx); err != nil {
+					s.Log.WarnContext(s.ctx, "Unable to reconcile resources", "error", err)
+				}
+
+				if s.onKubernetesClusterReconcile != nil {
+					s.onKubernetesClusterReconcile()
+				}
+
+			case <-s.ctx.Done():
+				return
+			}
+		}
+	}()
+	return nil
+}
+
+func (s *Server) onKubeCreate(ctx context.Context, kubeCluster types.KubeCluster) error {
+	s.Log.DebugContext(ctx, "Creating kube_cluster", "kube_cluster_name", kubeCluster.GetName())
+	err := s.AccessPoint.CreateKubernetesCluster(ctx, kubeCluster)
+	// If the kube already exists but has an empty discovery group, update it.
+	if err != nil {
+		err := s.resolveCreateErr(err, types.OriginCloud, func() (types.ResourceWithLabels, error) {
+			return s.AccessPoint.GetKubernetesCluster(ctx, kubeCluster.GetName())
+		})
+		if err != nil {
+			return trace.Wrap(err)
+		}
+		return trace.Wrap(s.onKubeUpdate(ctx, kubeCluster, nil))
+	}
+	err = s.emitUsageEvent(kubeEventPrefix+kubeCluster.GetName(), &usageeventsv1.ResourceCreateEvent{
+		ResourceType:        types.DiscoveredResourceKubernetes,
+		ResourceOrigin:      types.OriginCloud,
+		CloudProvider:       kubeCluster.GetCloud(),
+		DiscoveryConfigName: kubeCluster.GetStaticLabels()[types.TeleportInternalDiscoveryConfigName],
+	})
+	if err != nil {
+		s.Log.DebugContext(ctx, "Error emitting usage event", "error", err)
+	}
+	return nil
+}
+
+func (s *Server) onKubeUpdate(ctx context.Context, kubeCluster, _ types.KubeCluster) error {
+	s.Log.DebugContext(ctx, "Updating kube_cluster", "kube_cluster_name", kubeCluster.GetName())
+	return trace.Wrap(s.AccessPoint.UpdateKubernetesCluster(ctx, kubeCluster))
+}
+
+func (s *Server) onKubeDelete(ctx context.Context, kubeCluster types.KubeCluster) error {
+	s.Log.DebugContext(ctx, "Deleting kube_cluster", "kube_cluster_name", kubeCluster.GetName())
+	if err := fetchers.DeleteKubernetesDanglingResources(
+		ctx,
+		fetchers.DeleteKubernetesDanglingResourcesConfig{
+			ClientGetter: s.AWSFetchersClients,
+			Cluster:      kubeCluster,
+			Logger:       s.Log,
+		},
+	); err != nil {
+		s.Log.WarnContext(ctx, "Failed to delete dangling resources for kube_cluster",
+			"kube_cluster_name", kubeCluster.GetName(),
+			"error", err)
+	}
+	return trace.Wrap(s.AccessPoint.DeleteKubernetesCluster(ctx, kubeCluster.GetName()))
+}

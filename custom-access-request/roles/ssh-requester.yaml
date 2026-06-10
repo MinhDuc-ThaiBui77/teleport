@@ -1,0 +1,28 @@
+# Assigned to NORMAL USERS.
+# Grants the RIGHT TO REQUEST per-server roles, plus the minimal RBAC the
+# custom GUI needs to show the page and create/list the user's own requests.
+# This role grants NO SSH access by itself.
+kind: role
+version: v7
+metadata:
+  name: ssh-requester
+  description: "Can request time-limited access to individual servers"
+spec:
+  allow:
+    request:
+      # Glob lets a user request ANY per-server role; the APPROVAL step is the
+      # real gate. Tighten to an explicit list if you want per-user scoping, e.g.
+      #   roles: ['ssh-access-web1', 'ssh-access-db1']
+      roles: ['ssh-access-*']
+      # Do NOT add search_as_roles / thresholds here — enterprise-gated.
+
+    rules:
+      # Lets the GUI show its nav item and create/list the user's own requests.
+      # (Creating a *pending* request for self is also allowed by ownership, but
+      #  having 'create' here keeps the web UI's create flag enabled cleanly.)
+      - resources: [access_request]
+        verbs: [list, read, create]
+
+  options:
+    max_session_ttl: 8h
+    # Do NOT set request_access: reason|always — enterprise-gated.

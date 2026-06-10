@@ -1,0 +1,665 @@
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+package srv
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/gravitational/trace"
+	"golang.org/x/crypto/ssh"
+
+	"github.com/gravitational/teleport"
+	tracessh "github.com/gravitational/teleport/api/observability/tracing/ssh"
+	apievents "github.com/gravitational/teleport/api/types/events"
+	"github.com/gravitational/teleport/lib/events"
+	reexecutils "github.com/gravitational/teleport/lib/sshutils/reexec"
+	"github.com/gravitational/teleport/session/reexec"
+	"github.com/gravitational/teleport/session/reexec/reexecconstants"
+)
+
+// ExecResult is used internally to send the result of a command execution from
+// a goroutine to SSH request handler and back to the calling client
+type ExecResult struct {
+	// Command is the command that was executed.
+	Command string
+
+	// Code is return code that execution of the command resulted in.
+	Code int
+
+	// Error is a launch error from the child process.
+	Error error
+}
+
+// Exec executes an "exec" request.
+type Exec interface {
+	// GetCommand returns the command to be executed.
+	GetCommand() string
+
+	// SetCommand sets the command to be executed.
+	SetCommand(string)
+
+	// Start will start the execution of the command.
+	Start(ctx context.Context, channel ssh.Channel) error
+
+	// Wait will block while the command executes.
+	Wait() ExecResult
+
+	// ReadAuditSessionID reads the unique audit session ID of the process
+	// that will be used to correlate audit events to the SSH session for
+	// sessions with Enhanced Session Recording enabled. Otherwise, this
+	// method is a no-op.
+	ReadAuditSessionID() (uint32, error)
+
+	// Continue will resume execution of the process after it completes its
+	// pre-processing routine if Enhanced Session Recording is enabled.
+	// Otherwise, this method is a no-op.
+	Continue()
+
+	// PID returns the PID of the Teleport process that was re-execed.
+	PID() int
+}
+
+// NewExecRequest creates a new local or remote Exec.
+func NewExecRequest(ctx *ServerContext, command string) (Exec, error) {
+	// It doesn't matter what mode the cluster is in, if this is a Teleport node
+	// return a local *localExec.
+	if ctx.srv.Component() == teleport.ComponentNode {
+		return &localExec{
+			Ctx:     ctx,
+			Command: command,
+		}, nil
+	}
+
+	// If this is a forwarding node, execute the command on a remote host.
+	if ctx.srv.Component() == teleport.ComponentForwardingNode {
+		return &remoteExec{
+			ctx:     ctx,
+			command: command,
+			session: ctx.RemoteSession,
+		}, nil
+	}
+
+	// Otherwise return a *localExec which will execute locally on the server.
+	// used by the regular Teleport nodes.
+	return &localExec{
+		Ctx:     ctx,
+		Command: command,
+	}, nil
+}
+
+// localExec prepares the response to a 'exec' SSH request, i.e. executing
+// a command after making an SSH connection and delivering the result back.
+type localExec struct {
+	// Command is the command that will be executed.
+	Command string
+
+	// Cmd holds an *exec.Cmd which will be used for local execution.
+	Cmd *reexec.CommandExecutor
+
+	// Ctx holds the *ServerContext.
+	Ctx *ServerContext
+
+	// waitForOutputStreams tracks goroutines that copy stderr/stdout from child
+	// reexec and shell processes. This is necessary due to the use of custom pipes,
+	// which exec.Cmd does not wait for closure of in cmd.Wait().
+	waitForOutputStreams sync.WaitGroup
+	// childStderr is stderr read from the child process which may be populated once
+	// waitForOutputStreams completes.
+	childStderr string
+
+	pid int
+}
+
+// GetCommand returns the command string.
+func (e *localExec) GetCommand() string {
+	return e.Command
+}
+
+// SetCommand sets the command string.
+func (e *localExec) SetCommand(command string) {
+	e.Command = command
+}
+
+// Start launches the given command.
+func (e *localExec) Start(ctx context.Context, channel ssh.Channel) error {
+	logger := e.Ctx.Logger.With("command", e.GetCommand())
+
+	// Parse the command to see if it is scp.
+	err := e.transformSecureCopy()
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
+	// Create pipes to capture stdio of the shell (grandchild) process, closing our
+	// side of each pipe after starting the command.
+	shellStdinR, shellStdinW, err := os.Pipe()
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	defer shellStdinR.Close()
+	e.Ctx.AddCloser(shellStdinW)
+
+	shellStdoutR, shellStdoutW, err := os.Pipe()
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	defer shellStdoutW.Close()
+	e.Ctx.AddCloser(shellStdoutR)
+
+	shellStderrR, shellStderrW, err := os.Pipe()
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	defer shellStderrW.Close()
+	e.Ctx.AddCloser(shellStderrR)
+
+	// Create the command that will actually execute.
+	e.Cmd, err = e.Ctx.ConfigureCommand(map[reexec.FileFD]*os.File{
+		reexec.StdinFile:  shellStdinR,
+		reexec.StdoutFile: shellStdoutW,
+		reexec.StderrFile: shellStderrW,
+	})
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
+	// Capture stderr.
+	stderrR, stderrW, err := os.Pipe()
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	defer stderrW.Close()
+	e.Cmd.Stderr = stderrW
+
+	e.waitForOutputStreams.Go(func() {
+		defer stderrR.Close()
+
+		childErr, err := reexecutils.ReadChildErrorWithContext(stderrR, &reexecutils.ErrorContext{
+			DecisionContext: e.Ctx.Identity.AccessPermit.GetDecisionContext(),
+			Login:           e.Ctx.Identity.Login,
+		})
+		if err != nil {
+			logger.WarnContext(context.WithoutCancel(ctx), "Failed to read child process stderr", "error", err)
+			return
+		}
+		if childErr == "" {
+			return
+		}
+
+		e.childStderr = childErr
+		if _, err := crlfReplacer.WriteString(channel, childErr); err != nil {
+			logger.WarnContext(context.WithoutCancel(ctx), "Failed to propagate child process stderr to client", "error", err)
+		}
+	})
+
+	// Start the command.
+	err = e.Cmd.Start()
+	if err != nil {
+		logger.WarnContext(ctx, "Local command failed to start", "error", err)
+
+		// Emit the result of execution to the audit log
+		emitExecAuditEvent(e.Ctx, ExecResult{
+			Command: e.GetCommand(),
+			Code:    reexecconstants.RemoteCommandFailure,
+			Error:   err,
+		})
+
+		return trace.ConvertSystemError(err)
+	}
+
+	// Save off the PID of the Teleport process under which the command is executing.
+	e.pid = e.Cmd.Process.Pid
+
+	// copy stdio between the channel and shell process.
+	go func() {
+		if _, err := io.Copy(shellStdinW, channel); err != nil {
+			logger.WarnContext(ctx, "Failed to forward stdin from SSH channel to local command", "error", err)
+		}
+		shellStdinW.Close()
+	}()
+	e.waitForOutputStreams.Go(func() {
+		if _, err := io.Copy(channel, shellStdoutR); err != nil {
+			logger.WarnContext(ctx, "Failed to forward stdout from local command to SSH channel", "error", err)
+		}
+	})
+	e.waitForOutputStreams.Go(func() {
+		if _, err := io.Copy(channel.Stderr(), shellStderrR); err != nil {
+			logger.WarnContext(ctx, "Failed to forward stderr from local command to SSH channel", "error", err)
+		}
+	})
+
+	logger.InfoContext(ctx, "Started local command execution")
+
+	return nil
+}
+
+// Wait will block while the command executes.
+func (e *localExec) Wait() ExecResult {
+	if e.Cmd.Process == nil {
+		e.Ctx.Logger.ErrorContext(e.Ctx.CancelContext(), "No process")
+	}
+
+	// Block until the command is finished executing.
+	exitErr := e.Cmd.Wait()
+	e.waitForOutputStreams.Wait()
+	if exitErr != nil {
+		e.Ctx.Logger.DebugContext(e.Ctx.CancelContext(), "Local command failed", "error", exitErr)
+	} else {
+		e.Ctx.Logger.DebugContext(e.Ctx.CancelContext(), "Local command successfully executed")
+	}
+
+	result := ExecResult{
+		Command: e.GetCommand(),
+		Code:    exitCode(exitErr),
+		// Error omitted on purpose, we don't want trivial errors to be logged to audit.
+	}
+
+	if e.childStderr != "" {
+		result.Error = errors.New(strings.TrimRight(e.childStderr, "\r\n"))
+	} else if exitErr != nil {
+		// If we get a non exec.ExitError and no launch error, preserve the
+		// error from Wait as it may indicate some other genuine error.
+		var execExitErr *exec.ExitError
+		if !errors.As(exitErr, &execExitErr) {
+			result.Error = exitErr
+		}
+	}
+
+	// Emit the result of execution to the Audit Log.
+	emitExecAuditEvent(e.Ctx, result)
+
+	return result
+}
+
+// ReadAuditSessionID reads the unique audit session ID of the process
+// that will be used to correlate audit events to the SSH session for
+// sessions with Enhanced Session Recording enabled. Otherwise, this
+// method is a no-op.
+func (e *localExec) ReadAuditSessionID() (uint32, error) {
+	if !e.Ctx.recordWithBPF() {
+		return 0, nil
+	}
+
+	if err := e.Cmd.WaitForChild(); err != nil {
+		return 0, trace.Wrap(err)
+	}
+
+	return readAuditSessionID(e.pid)
+}
+
+// Continue will resume execution of the process after it completes its
+// pre-processing routine if Enhanced Session Recording is enabled.
+// Otherwise, this method is a no-op.
+func (e *localExec) Continue() {
+	e.Cmd.Continue()
+}
+
+// PID returns the PID of the Teleport process that was re-execed.
+func (e *localExec) PID() int {
+	return e.pid
+}
+
+func (e *localExec) String() string {
+	return fmt.Sprintf("Exec(Command=%v)", e.Command)
+}
+
+func (e *localExec) transformSecureCopy() error {
+	isSCPCmd, err := checkSCPAllowed(e.Ctx, e.GetCommand())
+	if err != nil {
+		e.Ctx.GetServer().EmitAuditEvent(e.Ctx.CancelContext(), &apievents.SFTP{
+			Metadata: apievents.Metadata{
+				Code: events.SFTPDisallowedCode,
+				Type: events.SFTPEvent,
+				Time: time.Now(),
+			},
+			UserMetadata:   e.Ctx.Identity.GetUserMetadata(),
+			ServerMetadata: e.Ctx.GetServer().EventMetadata(),
+			Error:          err.Error(),
+		})
+		return trace.Wrap(err)
+	}
+	if !isSCPCmd {
+		return nil
+	}
+	_, scpArgs, ok := strings.Cut(e.GetCommand(), " ")
+	if !ok {
+		return nil
+	}
+
+	// for scp requests update the command to execute to launch teleport with
+	// scp parameters just like openssh does.
+	teleportBin, err := os.Executable()
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	e.Command = fmt.Sprintf("%s scp --remote-addr=%q --local-addr=%q %v",
+		teleportBin,
+		e.Ctx.ServerConn.RemoteAddr().String(),
+		e.Ctx.ServerConn.LocalAddr().String(),
+		scpArgs,
+	)
+
+	return nil
+}
+
+// checkSCPAllowed will return false if the command is not a SCP command,
+// and if it is it will return true and potentially an error if file
+// copying is not allowed.
+func checkSCPAllowed(scx *ServerContext, command string) (bool, error) {
+	// split up command by space to grab the first word. if we don't have anything
+	// it's an interactive shell the user requested and not scp, return
+	args := strings.Split(command, " ")
+	if len(args) == 0 {
+		return false, nil
+	}
+	// see the user is not requesting scp, return
+	if _, f := filepath.Split(args[0]); f != teleport.SCP {
+		return false, nil
+	}
+
+	return true, trace.Wrap(scx.CheckFileCopyingAllowed())
+}
+
+func readAuditSessionID(pid int) (uint32, error) {
+	if pid == 0 {
+		return 0, trace.BadParameter("pid is zero")
+	}
+
+	pidStr := strconv.Itoa(pid)
+	sessionIDPath := filepath.Join("/proc", pidStr, "sessionid")
+	sessionIDBytes, err := os.ReadFile(sessionIDPath)
+	if err != nil {
+		return 0, trace.Wrap(err)
+	}
+	sessionIDStr := strings.TrimSpace(string(sessionIDBytes))
+
+	sessionID, err := strconv.ParseUint(sessionIDStr, 10, 32)
+	if err != nil {
+		return 0, trace.Wrap(err)
+	}
+
+	return uint32(sessionID), nil
+}
+
+// remoteExec is used to run an "exec" SSH request and return the result.
+type remoteExec struct {
+	command string
+	session *tracessh.Session
+	ctx     *ServerContext
+}
+
+// String describes this remote exec value
+func (e *remoteExec) String() string {
+	return fmt.Sprintf("RemoteExec(Command=%v)", e.command)
+}
+
+// GetCommand returns the command string.
+func (e *remoteExec) GetCommand() string {
+	return e.command
+}
+
+// SetCommand sets the command string.
+func (e *remoteExec) SetCommand(command string) {
+	e.command = command
+}
+
+// Start launches the given command.
+func (e *remoteExec) Start(ctx context.Context, ch ssh.Channel) error {
+	if _, err := checkSCPAllowed(e.ctx, e.GetCommand()); err != nil {
+		e.ctx.GetServer().EmitAuditEvent(context.WithoutCancel(ctx), &apievents.SFTP{
+			Metadata: apievents.Metadata{
+				Code: events.SFTPDisallowedCode,
+				Type: events.SFTPEvent,
+				Time: time.Now(),
+			},
+			UserMetadata:   e.ctx.Identity.GetUserMetadata(),
+			ServerMetadata: e.ctx.GetServer().EventMetadata(),
+			Error:          err.Error(),
+		})
+		return trace.Wrap(err)
+	}
+
+	// hook up stdout/err the channel so the user can interact with the command
+	e.session.Stdout = ch
+	e.session.Stderr = ch.Stderr()
+	inputWriter, err := e.session.StdinPipe()
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
+	go func() {
+		// copy from the channel (client) into stdin of the process
+		if _, err := io.Copy(inputWriter, ch); err != nil {
+			e.ctx.Logger.WarnContext(ctx, "Failed copying data from SSH channel to remote command stdin", "error", err)
+		}
+		inputWriter.Close()
+	}()
+
+	err = e.session.Start(ctx, e.command)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
+	return nil
+}
+
+// Wait will block while the command executes.
+func (e *remoteExec) Wait() ExecResult {
+	// Block until the command is finished executing.
+	err := e.session.Wait()
+	if err != nil {
+		e.ctx.Logger.DebugContext(e.ctx.CancelContext(), "Remote command failed", "error", err)
+	} else {
+		e.ctx.Logger.DebugContext(e.ctx.CancelContext(), "Remote command successfully executed")
+	}
+
+	result := ExecResult{
+		Command: e.command,
+	}
+
+	var sshExitErr *ssh.ExitError
+	if errors.As(err, &sshExitErr) {
+		result.Code = sshExitErr.ExitStatus()
+		// Error omitted on purpose, we don't want trivial errors to be logged to audit.
+	} else if err != nil {
+		result.Code = reexecconstants.RemoteCommandFailure
+		result.Error = err
+	}
+
+	// Emit the result of execution to the Audit Log.
+	emitExecAuditEvent(e.ctx, result)
+
+	return result
+}
+
+func (e *remoteExec) ReadAuditSessionID() (uint32, error) { return 0, nil }
+
+// Continue does nothing for remote command execution.
+func (e *remoteExec) Continue() {}
+
+// PID returns an invalid PID for remotExec.
+func (e *remoteExec) PID() int {
+	return 0
+}
+
+// emitExecAuditEvent emits either an SCP or exec event based on the
+// command run.
+//
+// Note: to ensure that the event is recorded ctx.session must be used
+// instead of ctx.srv.
+func emitExecAuditEvent(ctx *ServerContext, result ExecResult) {
+	// Create common fields for event.
+	serverMeta := ctx.GetServer().EventMetadata()
+	sessionMeta := ctx.GetSessionMetadata()
+	userMeta := ctx.Identity.GetUserMetadata()
+
+	connectionMeta := apievents.ConnectionMetadata{
+		RemoteAddr: ctx.ServerConn.RemoteAddr().String(),
+		LocalAddr:  ctx.ServerConn.LocalAddr().String(),
+	}
+
+	commandMeta := apievents.CommandMetadata{
+		Command: result.Command,
+		// Due to scp being inherently vulnerable to command injection, always
+		// make sure the full command and exit code is recorded for accountability.
+		// For more details, see the following.
+		//
+		// https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=327019
+		// https://bugzilla.mindrot.org/show_bug.cgi?id=1998
+		ExitCode: strconv.Itoa(result.Code),
+	}
+
+	if result.Error != nil {
+		commandMeta.Error = result.Error.Error()
+	}
+
+	// Parse the exec command to find out if it was SCP or not.
+	path, action, isSCP, err := parseSecureCopy(result.Command)
+	if err != nil {
+		ctx.Logger.WarnContext(ctx.srv.Context(), "Unable to parse scp command", "error", err)
+		return
+	}
+
+	// Update appropriate fields based off if the request was SCP or not.
+	if isSCP {
+		scpEvent := &apievents.SCP{
+			Metadata: apievents.Metadata{
+				Type:        events.SCPEvent,
+				ClusterName: ctx.ClusterName,
+			},
+			ServerMetadata:     serverMeta,
+			SessionMetadata:    sessionMeta,
+			UserMetadata:       userMeta,
+			ConnectionMetadata: connectionMeta,
+			CommandMetadata:    commandMeta,
+			Path:               path,
+			Action:             action,
+		}
+
+		switch action {
+		case events.SCPActionUpload:
+			if result.Code != 0 {
+				scpEvent.Code = events.SCPUploadFailureCode
+			} else {
+				scpEvent.Code = events.SCPUploadCode
+			}
+		case events.SCPActionDownload:
+			if result.Code != 0 {
+				scpEvent.Code = events.SCPDownloadFailureCode
+			} else {
+				scpEvent.Code = events.SCPDownloadCode
+			}
+		}
+		if err := ctx.session.emitAuditEvent(ctx.srv.Context(), scpEvent); err != nil {
+			ctx.Logger.WarnContext(ctx.srv.Context(), "Failed to emit scp event", "error", err)
+		}
+	} else {
+		execEvent := &apievents.Exec{
+			Metadata: apievents.Metadata{
+				Type:        events.ExecEvent,
+				ClusterName: ctx.ClusterName,
+			},
+			ServerMetadata:     serverMeta,
+			SessionMetadata:    sessionMeta,
+			UserMetadata:       userMeta,
+			ConnectionMetadata: connectionMeta,
+			CommandMetadata:    commandMeta,
+		}
+		if result.Code != 0 {
+			execEvent.Code = events.ExecFailureCode
+		} else {
+			execEvent.Code = events.ExecCode
+		}
+		if err := ctx.session.emitAuditEvent(ctx.srv.Context(), execEvent); err != nil {
+			ctx.Logger.WarnContext(ctx.srv.Context(), "Failed to emit exec event", "error", err)
+		}
+	}
+}
+
+// parseSecureCopy will parse a command and return if it's secure copy or not.
+func parseSecureCopy(path string) (string, string, bool, error) {
+	parts := strings.Fields(path)
+	if len(parts) == 0 {
+		return "", "", false, trace.BadParameter("no executable found")
+	}
+
+	// Look for the -t flag, it indicates that an upload occurred. The other
+	// flags do no matter for now.
+	action := events.SCPActionDownload
+	if slices.Contains(parts, "-t") {
+		action = events.SCPActionUpload
+	}
+
+	// Extract the name of the Teleport executable on disk.
+	teleportPath, err := os.Executable()
+	if err != nil {
+		return "", "", false, trace.Wrap(err)
+	}
+	_, teleportBinary := filepath.Split(teleportPath)
+
+	// Extract the name of the executable that was run. The command was secure
+	// copy if the executable was "scp" or "teleport".
+	_, executable := filepath.Split(parts[0])
+	switch executable {
+	case teleport.SCP, teleportBinary:
+		return parts[len(parts)-1], action, true, nil
+	default:
+		return "", "", false, nil
+	}
+}
+
+// exitCode extracts and returns the exit code from the error.
+func exitCode(err error) int {
+	// If no error occurred, return 0 (success).
+	if err == nil {
+		return reexecconstants.RemoteCommandSuccess
+	}
+
+	var execExitErr *exec.ExitError
+	var sshExitErr *ssh.ExitError
+	switch {
+	// Local execution.
+	case errors.As(err, &execExitErr):
+		waitStatus, ok := execExitErr.Sys().(syscall.WaitStatus)
+		if !ok {
+			return reexecconstants.RemoteCommandFailure
+		}
+		return waitStatus.ExitStatus()
+	// Remote execution.
+	case errors.As(err, &sshExitErr):
+		return sshExitErr.ExitStatus()
+	// An error occurred, but the type is unknown, return a generic 255 code.
+	default:
+		slog.DebugContext(context.Background(), "Unknown error returned when executing command", "error", err)
+		return reexecconstants.RemoteCommandFailure
+	}
+}
