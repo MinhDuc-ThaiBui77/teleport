@@ -4,7 +4,7 @@ go 1.26.4
 
 // TF provider dependencies
 require (
-	github.com/DataDog/datadog-agent/pkg/template v0.79.1
+	github.com/DataDog/datadog-agent/pkg/template v0.79.2
 	github.com/beevik/etree v1.6.0
 	github.com/gogo/protobuf v1.3.2
 	github.com/google/go-cmp v0.7.0
