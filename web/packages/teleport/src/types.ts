@@ -201,6 +201,7 @@ export interface FeatureFlags {
   nodes: boolean;
   activeSessions: boolean;
   accessRequests: boolean;
+  customAccessRequest: boolean;
   newAccessRequest: boolean;
   downloadCenter: boolean;
   supportLink: boolean;

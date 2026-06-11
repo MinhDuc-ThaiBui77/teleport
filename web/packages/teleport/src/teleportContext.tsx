@@ -193,6 +193,9 @@ class TeleportContext implements types.Context {
       nodes: userContext.getNodeAccess().list,
       activeSessions: userContext.getActiveSessionsAccess().list,
       accessRequests: hasAccessRequestsAccess(),
+      customAccessRequest:
+        userContext.getAccessRequestAccess().create ||
+        userContext.getAccessRequestAccess().edit,
       newAccessRequest: userContext.getAccessRequestAccess().create,
       downloadCenter: userContext.hasDownloadCenterListAccess(),
       supportLink: userContext.hasSupportPageLinkAccess(),
@@ -261,6 +264,7 @@ export const disabledFeatureFlags: types.FeatureFlags = {
   trustedClusters: false,
   users: false,
   newAccessRequest: false,
+  customAccessRequest: false,
   createTokens: false,
   listTokens: false,
   accessRequests: false,

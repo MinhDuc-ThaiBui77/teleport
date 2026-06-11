@@ -33,8 +33,13 @@ SUDO=()
 GO_REQ="1.26.4"
 NODE_REQ="24.16.0"
 PNPM_REQ="11.3.0"
+RUST_REQ="1.94.0"
+WASM_BINDGEN_REQ=""
+WASM_OPT_REQ="0.116.1"
 GO_ARCH=""
 NODE_ARCH=""
+
+export PATH="$HOME/.cargo/bin:/usr/local/go/bin:/usr/local/bin:$PATH"
 
 if ! : > "$LOG" 2>/dev/null; then
   echo "Cannot write log file: $LOG" >&2
@@ -132,6 +137,35 @@ load_required_versions() {
   else
     warn "package.json not found under $SRC; using pnpm default"
   fi
+
+  if [ -f "$SRC/rust-toolchain.toml" ]; then
+    local rust_line rust_ver
+    rust_line="$(grep -E '^[[:space:]]*channel[[:space:]]*=' "$SRC/rust-toolchain.toml" | head -n1 || true)"
+    rust_ver="$(printf '%s' "$rust_line" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)"
+    if [ -n "$rust_ver" ]; then
+      RUST_REQ="$rust_ver"
+    fi
+  else
+    warn "rust-toolchain.toml not found under $SRC; using Rust default"
+  fi
+
+  if [ -f "$SRC/Cargo.lock" ]; then
+    WASM_BINDGEN_REQ="$(awk '
+      $1 == "name" && $3 == "\"wasm-bindgen\"" { in_pkg=1; next }
+      in_pkg && $1 == "version" { gsub(/"/, "", $3); print $3; exit }
+    ' "$SRC/Cargo.lock")"
+  else
+    warn "Cargo.lock not found under $SRC; wasm-bindgen version cannot be detected"
+  fi
+
+  if [ -f "$SRC/build.assets/versions.mk" ]; then
+    local wasm_opt_line wasm_opt_ver
+    wasm_opt_line="$(grep -E '^WASM_OPT_VERSION[[:space:]]*\?=' "$SRC/build.assets/versions.mk" | head -n1 || true)"
+    wasm_opt_ver="$(printf '%s' "$wasm_opt_line" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)"
+    if [ -n "$wasm_opt_ver" ]; then
+      WASM_OPT_REQ="$wasm_opt_ver"
+    fi
+  fi
 }
 
 detect_arch() {
@@ -214,6 +248,101 @@ validate_pnpm() {
   version="$(pnpm --version 2>/dev/null)"
   echo "pnpm $version"
   ver_ge "$version" "$PNPM_REQ"
+}
+
+validate_rust() {
+  command -v rustup >/dev/null 2>&1 || return 1
+  command -v cargo >/dev/null 2>&1 || return 1
+  command -v rustc >/dev/null 2>&1 || return 1
+
+  local raw version
+  raw="$(rustc --version 2>/dev/null)"
+  version="$(extract_ver "$raw")"
+  echo "$raw"
+  [ -n "$version" ] && ver_ge "$version" "$RUST_REQ"
+}
+
+validate_wasm_target() {
+  command -v rustup >/dev/null 2>&1 || return 1
+  rustup target list --installed | grep -qx 'wasm32-unknown-unknown'
+}
+
+validate_wasm_bindgen() {
+  [ -n "$WASM_BINDGEN_REQ" ] || return 1
+  command -v wasm-bindgen >/dev/null 2>&1 || return 1
+  local version
+  version="$(wasm-bindgen --version 2>/dev/null | awk '{print $2}')"
+  echo "wasm-bindgen $version"
+  [ "$version" = "$WASM_BINDGEN_REQ" ]
+}
+
+validate_wasm_opt() {
+  command -v wasm-opt >/dev/null 2>&1 || return 1
+  local version
+  version="$(wasm-opt --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
+  echo "wasm-opt $version"
+  [ "$version" = "$WASM_OPT_REQ" ]
+}
+
+install_rust() {
+  if ! command -v rustup >/dev/null 2>&1; then
+    local rustup_script
+    rustup_script="/tmp/rustup-init.sh"
+    curl -fL --retry 3 --connect-timeout 20 -o "$rustup_script" https://sh.rustup.rs || return 1
+    sh "$rustup_script" -y --profile minimal --default-toolchain "$RUST_REQ" || return 1
+  fi
+
+  if [ -f "$HOME/.cargo/env" ]; then
+    # shellcheck disable=SC1091
+    . "$HOME/.cargo/env"
+  fi
+
+  hash -r 2>/dev/null || true
+
+  rustup toolchain install "$RUST_REQ" \
+    --profile minimal \
+    --target wasm32-unknown-unknown || return 1
+  rustup default "$RUST_REQ" || return 1
+  rustup target add wasm32-unknown-unknown --toolchain "$RUST_REQ" || return 1
+
+  if [ -d "$HOME/.cargo/bin" ]; then
+    as_root ln -sf "$HOME/.cargo/bin/rustup" /usr/local/bin/rustup || return 1
+    as_root ln -sf "$HOME/.cargo/bin/cargo" /usr/local/bin/cargo || return 1
+    as_root ln -sf "$HOME/.cargo/bin/rustc" /usr/local/bin/rustc || return 1
+  fi
+
+  validate_rust
+}
+
+install_wasm_bindgen() {
+  validate_rust || return 1
+  [ -n "$WASM_BINDGEN_REQ" ] || return 1
+
+  if validate_wasm_bindgen; then
+    echo "Existing wasm-bindgen satisfies requirement."
+    return 0
+  fi
+
+  cargo install wasm-bindgen-cli --force --locked --version "$WASM_BINDGEN_REQ" || return 1
+  if [ -d "$HOME/.cargo/bin" ]; then
+    as_root ln -sf "$HOME/.cargo/bin/wasm-bindgen" /usr/local/bin/wasm-bindgen || return 1
+  fi
+  validate_wasm_bindgen
+}
+
+install_wasm_opt() {
+  validate_rust || return 1
+
+  if validate_wasm_opt; then
+    echo "Existing wasm-opt satisfies requirement."
+    return 0
+  fi
+
+  cargo install --locked "wasm-opt@${WASM_OPT_REQ}" || return 1
+  if [ -d "$HOME/.cargo/bin" ]; then
+    as_root ln -sf "$HOME/.cargo/bin/wasm-opt" /usr/local/bin/wasm-opt || return 1
+  fi
+  validate_wasm_opt
 }
 
 install_go() {
@@ -302,7 +431,8 @@ main() {
   hdr "Teleport build environment preparation  ($(date -u '+%Y-%m-%d %H:%M:%S UTC'))"
   say "Log file : $LOG"
   say "Source   : $SRC"
-  say "Required : Go $GO_REQ, Node $NODE_REQ, pnpm $PNPM_REQ"
+  say "Required : Go $GO_REQ, Node $NODE_REQ, pnpm $PNPM_REQ, Rust $RUST_REQ"
+  say "Wasm     : wasm-bindgen ${WASM_BINDGEN_REQ:-<unknown>}, wasm-opt $WASM_OPT_REQ"
 
   run_step required "Detect supported architecture" detect_arch
   run_step required "Detect sudo/root access" setup_sudo
@@ -323,6 +453,7 @@ main() {
     xz-utils
     tar
     python3
+    perl
   )
 
   local pkg
@@ -344,6 +475,10 @@ main() {
   run_step required "Install/validate Go $GO_REQ" install_go
   run_step required "Install/validate Node.js $NODE_REQ" install_node
   run_step required "Install/validate pnpm $PNPM_REQ" install_pnpm
+  run_step required "Install/validate Rust $RUST_REQ" install_rust
+  run_step required "Validate Rust wasm target" validate_wasm_target
+  run_step required "Install/validate wasm-bindgen $WASM_BINDGEN_REQ" install_wasm_bindgen
+  run_step required "Install/validate wasm-opt $WASM_OPT_REQ" install_wasm_opt
 
   run_step required "Validate git" validate_command git
   run_step required "Validate make" validate_command make
@@ -354,6 +489,9 @@ main() {
   run_step required "Validate Go version" validate_go
   run_step required "Validate Node.js version" validate_node
   run_step required "Validate pnpm version" validate_pnpm
+  run_step required "Validate Rust version" validate_rust
+  run_step required "Validate wasm-bindgen version" validate_wasm_bindgen
+  run_step required "Validate wasm-opt version" validate_wasm_opt
 
   hdr "SUMMARY"
   say "PASS: $PASS    WARN: $WARN    FAIL: $FAIL    SKIP: $SKIP"

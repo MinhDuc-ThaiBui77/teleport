@@ -17,12 +17,16 @@
  */
 
 export {
+  assumeCustomAccessRequest,
   createCustomAccessRequest,
   fetchCustomAccessRequestCapabilities,
   fetchMyCustomAccessRequests,
+  fetchPendingCustomAccessRequests,
+  resolveCustomAccessRequest,
 } from './customAccessRequests';
 export type {
   CreateCustomAccessRequestParams,
   CustomAccessRequest,
   CustomAccessRequestCapabilities,
+  ResolveCustomAccessRequestParams,
 } from './customAccessRequests';

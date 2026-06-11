@@ -21,6 +21,7 @@
 
 import cfg from 'teleport/config';
 import api from 'teleport/services/api';
+import websession from 'teleport/services/websession';
 
 export type CustomAccessRequest = {
   id: string;
@@ -48,6 +49,11 @@ export type CreateCustomAccessRequestParams = {
   maxDurationMs?: number;
   suggestedReviewers?: string[];
   dryRun?: boolean;
+};
+
+export type ResolveCustomAccessRequestParams = {
+  state: 'APPROVED' | 'DENIED';
+  reason?: string;
 };
 
 function makeAccessRequest(json: any): CustomAccessRequest {
@@ -86,6 +92,15 @@ export function fetchMyCustomAccessRequests(
     .then(json => (json?.items ?? []).map(makeAccessRequest));
 }
 
+export function fetchPendingCustomAccessRequests(
+  clusterId: string,
+  signal?: AbortSignal
+): Promise<CustomAccessRequest[]> {
+  return api
+    .get(cfg.getAccessRequestsCustomPendingUrl(clusterId), signal)
+    .then(json => (json?.items ?? []).map(makeAccessRequest));
+}
+
 export function createCustomAccessRequest(
   clusterId: string,
   params: CreateCustomAccessRequestParams
@@ -93,4 +108,18 @@ export function createCustomAccessRequest(
   return api
     .post(cfg.getAccessRequestsCustomUrl(clusterId), params)
     .then(makeAccessRequest);
+}
+
+export function resolveCustomAccessRequest(
+  clusterId: string,
+  requestId: string,
+  params: ResolveCustomAccessRequestParams
+): Promise<CustomAccessRequest> {
+  return api
+    .post(cfg.getAccessRequestsCustomResolveUrl(clusterId, requestId), params)
+    .then(makeAccessRequest);
+}
+
+export function assumeCustomAccessRequest(requestId: string): Promise<Date> {
+  return websession.renewSession({ requestId });
 }

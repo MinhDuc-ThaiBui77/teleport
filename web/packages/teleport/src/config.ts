@@ -352,6 +352,10 @@ const cfg = {
     accessRequestsCustomPath: '/v1/webapi/sites/:clusterId/accessrequests',
     accessRequestsCustomCapabilitiesPath:
       '/v1/webapi/sites/:clusterId/accessrequests/capabilities',
+    accessRequestsCustomPendingPath:
+      '/v1/webapi/sites/:clusterId/accessrequests/pending',
+    accessRequestsCustomResolvePath:
+      '/v1/webapi/sites/:clusterId/accessrequests/resolve/:requestId',
 
     gitServer: {
       createOrOverwrite: '/v1/webapi/sites/:clusterId/gitservers',
@@ -1274,6 +1278,19 @@ const cfg = {
   getAccessRequestsCustomCapabilitiesUrl(clusterId: string) {
     return generatePath(cfg.api.accessRequestsCustomCapabilitiesPath, {
       clusterId,
+    });
+  },
+
+  getAccessRequestsCustomPendingUrl(clusterId: string) {
+    return generatePath(cfg.api.accessRequestsCustomPendingPath, {
+      clusterId,
+    });
+  },
+
+  getAccessRequestsCustomResolveUrl(clusterId: string, requestId: string) {
+    return generatePath(cfg.api.accessRequestsCustomResolvePath, {
+      clusterId,
+      requestId,
     });
   },
 

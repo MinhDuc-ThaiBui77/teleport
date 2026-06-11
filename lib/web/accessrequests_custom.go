@@ -33,6 +33,7 @@ package web
 
 import (
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -43,6 +44,8 @@ import (
 	"github.com/gravitational/teleport/lib/httplib"
 	"github.com/gravitational/teleport/lib/reversetunnelclient"
 )
+
+const customServerAccessRolePrefix = "ssh-access-"
 
 // createAccessRequestReq is the JSON body for creating a role-based access request.
 type createAccessRequestReq struct {
@@ -58,6 +61,14 @@ type createAccessRequestReq struct {
 	SuggestedReviewers []string `json:"suggestedReviewers"`
 	// DryRun, when true, validates the request without actually creating it.
 	DryRun bool `json:"dryRun"`
+}
+
+// resolveAccessRequestReq is the JSON body for approving or denying a request.
+type resolveAccessRequestReq struct {
+	// State must be APPROVED or DENIED.
+	State string `json:"state"`
+	// Reason is an optional resolve reason shown in audit/request details.
+	Reason string `json:"reason"`
 }
 
 // accessRequestInfo is the JSON representation of an access request returned to
@@ -83,6 +94,41 @@ func makeAccessRequestInfo(req types.AccessRequest) accessRequestInfo {
 		Created:     req.GetCreationTime(),
 		Expires:     req.GetAccessExpiry(),
 		MaxDuration: req.GetMaxDuration(),
+	}
+}
+
+func isCustomServerAccessRequest(req types.AccessRequest) bool {
+	roles := req.GetRoles()
+	if len(roles) == 0 {
+		return false
+	}
+
+	for _, role := range roles {
+		if !strings.HasPrefix(role, customServerAccessRolePrefix) {
+			return false
+		}
+	}
+	return true
+}
+
+func filterCustomServerAccessRoles(roles []string) []string {
+	filtered := make([]string, 0, len(roles))
+	for _, role := range roles {
+		if strings.HasPrefix(role, customServerAccessRolePrefix) {
+			filtered = append(filtered, role)
+		}
+	}
+	return filtered
+}
+
+func parseResolveState(state string) (types.RequestState, error) {
+	switch strings.ToUpper(strings.TrimSpace(state)) {
+	case "APPROVED", "APPROVE":
+		return types.RequestState_APPROVED, nil
+	case "DENIED", "DENY":
+		return types.RequestState_DENIED, nil
+	default:
+		return types.RequestState_NONE, trace.BadParameter("state must be APPROVED or DENIED")
 	}
 }
 
@@ -112,6 +158,11 @@ func (h *Handler) createAccessRequest(w http.ResponseWriter, r *http.Request, p 
 
 	if len(req.Roles) == 0 {
 		return nil, trace.BadParameter("at least one role must be requested")
+	}
+	for _, role := range req.Roles {
+		if !strings.HasPrefix(role, customServerAccessRolePrefix) {
+			return nil, trace.BadParameter("role %q is not a custom server-access role", role)
+		}
 	}
 
 	clt, err := sctx.GetUserClient(ctx, cluster)
@@ -168,10 +219,108 @@ func (h *Handler) listAccessRequests(w http.ResponseWriter, r *http.Request, p h
 
 	items := make([]accessRequestInfo, 0, len(reqs))
 	for _, req := range reqs {
+		if !isCustomServerAccessRequest(req) {
+			continue
+		}
 		items = append(items, makeAccessRequestInfo(req))
 	}
 
 	return listAccessRequestsResponse{Items: items}, nil
+}
+
+// listPendingAccessRequests returns pending custom server-access requests for
+// users allowed to approve them.
+//
+// GET /webapi/sites/:site/accessrequests/pending
+func (h *Handler) listPendingAccessRequests(w http.ResponseWriter, r *http.Request, p httprouter.Params, sctx *SessionContext, cluster reversetunnelclient.Cluster) (any, error) {
+	ctx := r.Context()
+
+	clt, err := sctx.GetUserClient(ctx, cluster)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	reqs, err := clt.GetAccessRequests(ctx, types.AccessRequestFilter{
+		State: types.RequestState_PENDING,
+	})
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	items := make([]accessRequestInfo, 0, len(reqs))
+	for _, req := range reqs {
+		if req.GetUser() == sctx.GetUser() {
+			continue
+		}
+		if !isCustomServerAccessRequest(req) {
+			continue
+		}
+		items = append(items, makeAccessRequestInfo(req))
+	}
+
+	return listAccessRequestsResponse{Items: items}, nil
+}
+
+// resolveAccessRequest approves or denies a custom server-access request using
+// the OSS-safe state update path (the same primitive used by tctl requests
+// approve/deny). It deliberately does not use SubmitAccessReview.
+//
+// POST /webapi/sites/:site/accessrequests/resolve/:request_id
+func (h *Handler) resolveAccessRequest(w http.ResponseWriter, r *http.Request, p httprouter.Params, sctx *SessionContext, cluster reversetunnelclient.Cluster) (any, error) {
+	ctx := r.Context()
+
+	requestID := p.ByName("request_id")
+	if requestID == "" {
+		return nil, trace.BadParameter("missing request id")
+	}
+
+	var req resolveAccessRequestReq
+	if err := httplib.ReadResourceJSON(r, &req); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	state, err := parseResolveState(req.State)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	clt, err := sctx.GetUserClient(ctx, cluster)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	found, err := clt.GetAccessRequests(ctx, types.AccessRequestFilter{
+		ID: requestID,
+	})
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	if len(found) != 1 {
+		return nil, trace.NotFound("access request %q not found", requestID)
+	}
+	if !isCustomServerAccessRequest(found[0]) {
+		return nil, trace.BadParameter("access request %q is not a custom server-access request", requestID)
+	}
+
+	if err := clt.SetAccessRequestState(ctx, types.AccessRequestUpdate{
+		RequestID: requestID,
+		State:     state,
+		Reason:    req.Reason,
+	}); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	updated, err := clt.GetAccessRequests(ctx, types.AccessRequestFilter{
+		ID: requestID,
+	})
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	if len(updated) != 1 {
+		return nil, trace.NotFound("access request %q not found after update", requestID)
+	}
+
+	return makeAccessRequestInfo(updated[0]), nil
 }
 
 // getAccessRequestCapabilities returns the roles the current user is allowed to
@@ -195,7 +344,7 @@ func (h *Handler) getAccessRequestCapabilities(w http.ResponseWriter, r *http.Re
 	}
 
 	return accessRequestCapabilitiesResponse{
-		RequestableRoles:   caps.RequestableRoles,
+		RequestableRoles:   filterCustomServerAccessRoles(caps.RequestableRoles),
 		SuggestedReviewers: caps.SuggestedReviewers,
 		RequireReason:      caps.RequireReason,
 	}, nil

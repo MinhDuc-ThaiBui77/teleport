@@ -1,74 +1,110 @@
-# Implementation — Custom Access Request GUI (OSS)
+# Implementation - Custom Access Request GUI (OSS)
 
-Status: **code complete, not yet built**. Build on a Linux machine (Teleport
-server does not run on Windows). Branch: `feature/custom-access-request-gui`.
+This fork adds an OSS-safe GUI for per-server, time-limited SSH access by
+requesting roles instead of Teleport Enterprise resource access requests.
 
-## What was added
+## Backend
 
-### Backend (Go) — proxy web API
-- **New file** `lib/web/accessrequests_custom.go` — three OSS-safe handlers:
-  | Method | Route (registered in `lib/web/apiserver.go`) | Purpose |
-  |--------|----------------------------------------------|---------|
-  | `POST` | `/webapi/sites/:site/accessrequests` | create a role-based request |
-  | `GET`  | `/webapi/sites/:site/accessrequests` | list current user's requests |
-  | `GET`  | `/webapi/sites/:site/accessrequests/capabilities` | roles the user may request |
-- Uses only Community-available auth client methods: `CreateAccessRequestV2`,
-  `GetAccessRequests`, `GetAccessCapabilities`. No enterprise-gated calls.
-- The frontend calls these as `/v1/webapi/...`; the proxy strips the `/v1`
-  prefix (`lib/web/apiserver.go`), so they map to the `/webapi/...` routes.
+File: `lib/web/accessrequests_custom.go`
 
-### Frontend (React/TS) — `web/packages/teleport/src`
-- **`config.ts`** — added route `customAccessRequest`, api paths
-  `accessRequestsCustomPath` + `accessRequestsCustomCapabilitiesPath`, and
-  getters `getCustomAccessRequestRoute` / `getAccessRequestsCustomUrl` /
-  `getAccessRequestsCustomCapabilitiesUrl`.
-- **`types.ts`** — added `NavTitle.RequestServerAccess`.
-- **New `services/customAccessRequests/`** — typed API client (`fetch…`,
-  `create…`).
-- **New `CustomAccessRequest/CustomAccessRequest.tsx`** — the page: pick
-  server-role(s) → reason → duration → submit; plus a "my requests" table.
-- **`features.tsx`** — registered `FeatureCustomAccessRequest` (nav item +
-  route) in `getOSSFeatures()`. Gated on the user's real RBAC create permission
-  (`flags.newAccessRequest`), NOT the enterprise entitlement, so it shows on OSS.
-- Routing is automatic: `Main.tsx` mounts every feature's `route`.
+Routes registered in `lib/web/apiserver.go`:
 
-Page URL: `/web/cluster/:clusterId/request-access`. Nav: Identity Governance →
-"Request Server Access" (visible to users whose role grants
-`access_request` `create`, e.g. the `ssh-requester` role).
+| Method | Route | Purpose |
+|--------|-------|---------|
+| `POST` | `/webapi/sites/:site/accessrequests` | Create a role-based request |
+| `GET` | `/webapi/sites/:site/accessrequests` | List the current user's requests |
+| `GET` | `/webapi/sites/:site/accessrequests/capabilities` | Return requestable roles |
+| `GET` | `/webapi/sites/:site/accessrequests/pending` | List pending custom server-access requests for approvers |
+| `POST` | `/webapi/sites/:site/accessrequests/resolve/:request_id` | Approve or deny a request |
 
-## Build (on the Linux build machine)
-```bash
-pnpm install                 # Node 24.16.0, pnpm
-make build-ui                # builds OSS web assets -> webassets/teleport/
-make teleport                # builds ./build/teleport with assets embedded
+The frontend calls these through `/v1/webapi/...`; the proxy strips `/v1`.
+
+Community-safe auth client methods used:
+
+- `CreateAccessRequestV2`
+- `GetAccessRequests`
+- `GetAccessCapabilities`
+- `SetAccessRequestState`
+
+Approval and denial deliberately use `SetAccessRequestState`, the same primitive
+used by `tctl requests approve|deny`. The code does not use
+`SubmitAccessReview`, which belongs to the Enterprise review flow.
+
+The custom handlers only create, list, and approve role requests where all
+requested roles use the `ssh-access-` prefix, keeping this GUI scoped to the
+per-server access model.
+
+## Frontend
+
+Files under `web/packages/teleport/src`:
+
+- `config.ts`: route, API paths, and URL getters for custom access requests.
+- `services/customAccessRequests/`: typed client for create/list/capabilities,
+  pending approvals, resolve approve/deny, and assume approved requests.
+- `CustomAccessRequest/CustomAccessRequest.tsx`: custom page with two tabs.
+- `features.tsx`: registers `FeatureCustomAccessRequest` in OSS features.
+- `teleportContext.tsx` and `types.ts`: add a `customAccessRequest` feature
+  flag based on real `access_request` create/update ACLs.
+- `types.ts`: adds `NavTitle.RequestServerAccess`.
+
+Page URL:
+
+```text
+/web/cluster/:clusterId/request-access
 ```
 
-## Fast dev loop (no Go rebuild for frontend changes)
-```bash
-# run the built proxy somewhere reachable, then:
-PROXY_TARGET=localhost:3080 pnpm start-teleport   # Vite, hot reload
+Navigation:
+
+```text
+Identity Governance -> Request Server Access
 ```
 
-## End-to-end test
-1. Apply the roles in `roles/` and assign `ssh-requester` to a test user
-   (see README.md).
-2. Log into the web UI as that user → Identity Governance →
-   "Request Server Access" → pick a server role → submit.
-3. Approve from CLI (OSS-safe): `tctl requests approve <id>`.
-4. The user runs `tsh login --request-id=<id>` and connects; access expires
-   after the role's `max_session_ttl`.
+## User Flow
 
-## Backend quick-check without the UI
+Requester tab:
+
+1. Pick a server role, displayed as a server name. For example,
+   `ssh-access-elastic-03` is shown as `elastic-03`.
+2. Enter reason and duration.
+3. Submit request.
+4. Once approved, click `Use access`.
+5. The web session is renewed with the approved request ID and redirects to
+   Resources.
+
+Approvals tab:
+
+1. Visible to users whose ACL includes access-request update permission.
+2. Lists pending custom server-access requests.
+3. Approver can enter an optional resolve reason.
+4. Approver clicks `Approve` or `Deny`.
+
+CLI remains supported:
+
 ```bash
-curl -k -b <session-cookie> \
-  https://<proxy>/v1/webapi/sites/<cluster>/accessrequests/capabilities
-curl -k -b <session-cookie> -X POST \
-  -d '{"roles":["ssh-access-web1"],"reason":"test"}' \
-  https://<proxy>/v1/webapi/sites/<cluster>/accessrequests
+tctl requests approve <request-id>
+tsh login --request-id=<request-id>
 ```
 
-## Maintenance (fork upkeep)
-- The handler lives in its own file (`accessrequests_custom.go`); only
-  `apiserver.go` has a 3-line route block to re-apply on rebase.
-- Frontend additions are isolated (new dirs + small diffs to `config.ts`,
-  `types.ts`, `features.tsx`).
+## OSS Guardrails
+
+Do not add these role fields in Community builds:
+
+- `allow.request.search_as_roles`
+- `allow.request.thresholds`
+- `allow.review_requests`
+- `options.request_access: reason | always`
+
+## Build
+
+```bash
+pnpm install
+make build-ui
+make build/teleport
+make build/tctl
+```
+
+If needed for minimal local builds:
+
+```bash
+make build/teleport PIV=no
+```

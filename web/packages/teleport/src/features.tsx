@@ -113,8 +113,8 @@ class AccessRequests implements TeleportFeature {
 
 // FeatureCustomAccessRequest is a fork addition: an OSS-friendly page for
 // requesting time-limited access to individual servers (role-based requests).
-// Gated on the user's real RBAC create permission, NOT the enterprise
-// entitlement, so it works on a Community build.
+// Gated on the user's real RBAC access-request permissions, NOT the enterprise
+// entitlement, so it works on a Community build for requesters and approvers.
 export class FeatureCustomAccessRequest implements TeleportFeature {
   category = NavigationCategory.IdentityGovernance;
 
@@ -126,7 +126,7 @@ export class FeatureCustomAccessRequest implements TeleportFeature {
   };
 
   hasAccess(flags: FeatureFlags) {
-    return flags.newAccessRequest;
+    return flags.customAccessRequest;
   }
 
   navigationItem = {
