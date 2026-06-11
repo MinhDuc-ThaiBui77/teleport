@@ -29,7 +29,10 @@ export type CustomAccessRequest = {
   roles: string[];
   /** Server-side state, e.g. PENDING / APPROVED / DENIED. */
   state: string;
+  /** The requester's own justification. */
   reason?: string;
+  /** The note an approver left when approving/denying. */
+  resolveReason?: string;
   created: string;
   expires: string;
   maxDuration: string;
@@ -64,6 +67,7 @@ function makeAccessRequest(json: any): CustomAccessRequest {
     roles: json.roles ?? [],
     state: json.state,
     reason: json.reason,
+    resolveReason: json.resolveReason,
     created: json.created,
     expires: json.expires,
     maxDuration: json.maxDuration,

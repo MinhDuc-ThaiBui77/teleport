@@ -74,26 +74,30 @@ type resolveAccessRequestReq struct {
 // accessRequestInfo is the JSON representation of an access request returned to
 // the UI. It intentionally exposes only the fields the custom UI needs.
 type accessRequestInfo struct {
-	ID          string    `json:"id"`
-	User        string    `json:"user"`
-	Roles       []string  `json:"roles"`
-	State       string    `json:"state"`
-	Reason      string    `json:"reason,omitempty"`
-	Created     time.Time `json:"created"`
-	Expires     time.Time `json:"expires"`
-	MaxDuration time.Time `json:"maxDuration"`
+	ID    string   `json:"id"`
+	User  string   `json:"user"`
+	Roles []string `json:"roles"`
+	State string   `json:"state"`
+	// Reason is the requester's own justification.
+	Reason string `json:"reason,omitempty"`
+	// ResolveReason is the note an approver left when approving/denying.
+	ResolveReason string    `json:"resolveReason,omitempty"`
+	Created       time.Time `json:"created"`
+	Expires       time.Time `json:"expires"`
+	MaxDuration   time.Time `json:"maxDuration"`
 }
 
 func makeAccessRequestInfo(req types.AccessRequest) accessRequestInfo {
 	return accessRequestInfo{
-		ID:          req.GetName(),
-		User:        req.GetUser(),
-		Roles:       req.GetRoles(),
-		State:       req.GetState().String(),
-		Reason:      req.GetRequestReason(),
-		Created:     req.GetCreationTime(),
-		Expires:     req.GetAccessExpiry(),
-		MaxDuration: req.GetMaxDuration(),
+		ID:            req.GetName(),
+		User:          req.GetUser(),
+		Roles:         req.GetRoles(),
+		State:         req.GetState().String(),
+		Reason:        req.GetRequestReason(),
+		ResolveReason: req.GetResolveReason(),
+		Created:       req.GetCreationTime(),
+		Expires:       req.GetAccessExpiry(),
+		MaxDuration:   req.GetMaxDuration(),
 	}
 }
 

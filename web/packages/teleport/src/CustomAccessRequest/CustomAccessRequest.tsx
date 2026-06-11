@@ -19,7 +19,7 @@
 // Custom (fork) page: lets OSS users request, approve, and assume
 // time-limited server access by using role-based access requests.
 
-import { type ChangeEvent, useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import styled from 'styled-components';
 
 import {
@@ -27,13 +27,18 @@ import {
   Box,
   ButtonPrimary,
   ButtonSecondary,
+  ButtonSelect,
   Flex,
   Indicator,
+  Input,
   Text,
   TextArea,
 } from 'design';
 import { Danger } from 'design/Alert';
-import { useAsync } from 'shared/hooks/useAsync';
+import { CheckboxInput } from 'design/Checkbox';
+import Table, { Cell } from 'design/DataTable';
+import { SlideTabs } from 'design/SlideTabs';
+import { makeEmptyAttempt, useAsync } from 'shared/hooks/useAsync';
 
 import {
   FeatureBox,
@@ -51,22 +56,35 @@ import {
   resolveCustomAccessRequest,
 } from 'teleport/services/customAccessRequests';
 import history from 'teleport/services/history';
-import useTeleport from 'teleport/useTeleport';
 import useStickyClusterId from 'teleport/useStickyClusterId';
+import useTeleport from 'teleport/useTeleport';
 
 const SERVER_ACCESS_ROLE_PREFIX = 'ssh-access-';
+// Background refresh cadence so requesters/approvers see state changes without
+// manually clicking Refresh. Kept conservative for an internal tool.
+const POLL_INTERVAL_MS = 15000;
+const MAX_CUSTOM_DURATION = 999;
 
+type TabKey = 'request' | 'approvals';
 type DurationPreset = 'default' | '30m' | '1h' | '4h' | '8h' | '24h' | 'custom';
 type DurationUnit = 'minutes' | 'hours' | 'days';
+type ResolveState = 'APPROVED' | 'DENIED';
 
-const DURATION_OPTIONS: { value: DurationPreset; label: string; ms?: number }[] = [
-  { value: 'default', label: 'Default' },
-  { value: '30m', label: '30m', ms: 30 * 60 * 1000 },
-  { value: '1h', label: '1h', ms: 60 * 60 * 1000 },
-  { value: '4h', label: '4h', ms: 4 * 60 * 60 * 1000 },
-  { value: '8h', label: '8h', ms: 8 * 60 * 60 * 1000 },
-  { value: '24h', label: '24h', ms: 24 * 60 * 60 * 1000 },
-  { value: 'custom', label: 'Custom' },
+const DURATION_OPTIONS: { value: DurationPreset; label: string; ms?: number }[] =
+  [
+    { value: 'default', label: 'Default' },
+    { value: '30m', label: '30m', ms: 30 * 60 * 1000 },
+    { value: '1h', label: '1h', ms: 60 * 60 * 1000 },
+    { value: '4h', label: '4h', ms: 4 * 60 * 60 * 1000 },
+    { value: '8h', label: '8h', ms: 8 * 60 * 60 * 1000 },
+    { value: '24h', label: '24h', ms: 24 * 60 * 60 * 1000 },
+    { value: 'custom', label: 'Custom' },
+  ];
+
+const UNIT_OPTIONS: { value: DurationUnit; label: string }[] = [
+  { value: 'minutes', label: 'minutes' },
+  { value: 'hours', label: 'hours' },
+  { value: 'days', label: 'days' },
 ];
 
 export function CustomAccessRequest() {
@@ -84,7 +102,7 @@ export function CustomAccessRequest() {
   const [listAttempt, runFetchList] = useAsync(
     useCallback(() => fetchMyCustomAccessRequests(clusterId), [clusterId])
   );
-  const [createAttempt, runCreate] = useAsync(
+  const [createAttempt, runCreate, setCreateAttempt] = useAsync(
     useCallback(
       (roles: string[], reason: string, maxDurationMs?: number) =>
         createCustomAccessRequest(clusterId, {
@@ -98,12 +116,12 @@ export function CustomAccessRequest() {
   const [pendingAttempt, runFetchPending] = useAsync(
     useCallback(() => fetchPendingCustomAccessRequests(clusterId), [clusterId])
   );
-  const [assumeAttempt, runAssume] = useAsync(
+  const [assumeAttempt, runAssume, setAssumeAttempt] = useAsync(
     useCallback((requestId: string) => assumeCustomAccessRequest(requestId), [])
   );
-  const [resolveAttempt, runResolve] = useAsync(
+  const [resolveAttempt, runResolve, setResolveAttempt] = useAsync(
     useCallback(
-      (requestId: string, state: 'APPROVED' | 'DENIED', reason: string) =>
+      (requestId: string, state: ResolveState, reason: string) =>
         resolveCustomAccessRequest(clusterId, requestId, {
           state,
           reason: reason.trim() || undefined,
@@ -112,20 +130,25 @@ export function CustomAccessRequest() {
     )
   );
 
-  const [activeTab, setActiveTab] = useState<'request' | 'approvals'>(
-    'request'
-  );
+  const [activeTab, setActiveTab] = useState<TabKey>('request');
+  const [submitOk, setSubmitOk] = useState(false);
   const [selectedRoles, setSelectedRoles] = useState<string[]>([]);
   const [reason, setReason] = useState('');
-  const [resolveReason, setResolveReason] = useState('');
-  const [durationPreset, setDurationPreset] =
-    useState<DurationPreset>('default');
+  const [durationPreset, setDurationPreset] = useState<DurationPreset>('default');
   const [customDurationValue, setCustomDurationValue] = useState('2');
   const [customDurationUnit, setCustomDurationUnit] =
     useState<DurationUnit>('hours');
   const [assumingRequestId, setAssumingRequestId] = useState('');
   const [resolvingRequestId, setResolvingRequestId] = useState('');
+  const [resolvingState, setResolvingState] = useState<ResolveState | ''>('');
+  const [confirmDenyId, setConfirmDenyId] = useState('');
+  // Per-row approver note so a reason typed for one request can never attach to
+  // another.
+  const [resolveReasonById, setResolveReasonById] = useState<
+    Record<string, string>
+  >({});
 
+  // Initial load.
   useEffect(() => {
     runFetchCaps();
     runFetchList();
@@ -135,7 +158,34 @@ export function CustomAccessRequest() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [clusterId, canResolveRequests]);
 
+  // Background refresh of the visible tab so state changes (approval, new
+  // pending requests) appear without manual refresh.
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      if (document.hidden) {
+        return;
+      }
+      if (activeTab === 'request') {
+        runFetchList();
+      } else if (activeTab === 'approvals' && canResolveRequests) {
+        runFetchPending();
+      }
+    }, POLL_INTERVAL_MS);
+    return () => window.clearInterval(id);
+  }, [activeTab, canResolveRequests, runFetchList, runFetchPending]);
+
+  function switchTab(tab: TabKey) {
+    setActiveTab(tab);
+    setSubmitOk(false);
+    setConfirmDenyId('');
+    // Clear any stale action banners so they don't reappear on revisit.
+    setCreateAttempt(makeEmptyAttempt());
+    setAssumeAttempt(makeEmptyAttempt());
+    setResolveAttempt(makeEmptyAttempt());
+  }
+
   function toggleRole(role: string) {
+    setSubmitOk(false);
     setSelectedRoles(prev =>
       prev.includes(role) ? prev.filter(r => r !== role) : [...prev, role]
     );
@@ -148,6 +198,7 @@ export function CustomAccessRequest() {
       getDurationMs(durationPreset, customDurationValue, customDurationUnit)
     );
     if (!err) {
+      setSubmitOk(true);
       setSelectedRoles([]);
       setReason('');
       setDurationPreset('default');
@@ -164,20 +215,26 @@ export function CustomAccessRequest() {
       setAssumingRequestId('');
       return;
     }
-
     history.push(cfg.getUnifiedResourcesRoute(clusterId), true);
   }
 
-  async function onResolve(
-    requestId: string,
-    state: 'APPROVED' | 'DENIED'
-  ) {
+  async function onResolve(requestId: string, state: ResolveState) {
+    setConfirmDenyId('');
     setResolvingRequestId(requestId);
-    const [, err] = await runResolve(requestId, state, resolveReason);
+    setResolvingState(state);
+    const [, err] = await runResolve(
+      requestId,
+      state,
+      resolveReasonById[requestId] || ''
+    );
     setResolvingRequestId('');
-
+    setResolvingState('');
     if (!err) {
-      setResolveReason('');
+      setResolveReasonById(prev => {
+        const next = { ...prev };
+        delete next[requestId];
+        return next;
+      });
       runFetchPending();
       runFetchList();
     }
@@ -185,34 +242,54 @@ export function CustomAccessRequest() {
 
   const requireReason = !!capsAttempt.data?.requireReason;
   const requestableRoles = capsAttempt.data?.requestableRoles ?? [];
+  const durationValid = isDurationValid(durationPreset, customDurationValue);
   const canSubmit =
     selectedRoles.length > 0 &&
     (!requireReason || reason.trim().length > 0) &&
-    isDurationValid(durationPreset, customDurationValue) &&
+    durationValid &&
     createAttempt.status !== 'processing';
+
+  // Keep the last successfully-loaded rows so a transient background-poll
+  // failure doesn't blank the table or flash an unprompted error banner
+  // (useAsync nulls `data` on error).
+  const lastListRef = useRef<AccessRequest[] | undefined>(undefined);
+  if (listAttempt.data) {
+    lastListRef.current = listAttempt.data;
+  }
+  const listItems = listAttempt.data ?? lastListRef.current;
+
+  const lastPendingRef = useRef<AccessRequest[] | undefined>(undefined);
+  if (pendingAttempt.data) {
+    lastPendingRef.current = pendingAttempt.data;
+  }
+  const pendingItems = pendingAttempt.data ?? lastPendingRef.current;
+
+  const tabs: { key: TabKey; title: string }[] = [
+    { key: 'request', title: 'Request access' },
+    ...(canResolveRequests
+      ? [{ key: 'approvals' as const, title: 'Approvals' }]
+      : []),
+  ];
+  const activeIndex = Math.max(
+    0,
+    tabs.findIndex(t => t.key === activeTab)
+  );
 
   return (
     <ScrollableFeatureBox>
       <FeatureHeader>
-        <FeatureHeaderTitle>Request Server Access</FeatureHeaderTitle>
+        <FeatureHeaderTitle>Request server access</FeatureHeaderTitle>
       </FeatureHeader>
 
-      <TabBar mb={3}>
-        <TabButton
-          $active={activeTab === 'request'}
-          onClick={() => setActiveTab('request')}
-        >
-          Request access
-        </TabButton>
-        {canResolveRequests && (
-          <TabButton
-            $active={activeTab === 'approvals'}
-            onClick={() => setActiveTab('approvals')}
-          >
-            Approvals
-          </TabButton>
-        )}
-      </TabBar>
+      <Box mb={3} maxWidth={420}>
+        <SlideTabs
+          size="medium"
+          appearance="round"
+          activeIndex={activeIndex}
+          onChange={index => switchTab(tabs[index].key)}
+          tabs={tabs}
+        />
+      </Box>
 
       {activeTab === 'request' && (
         <>
@@ -222,9 +299,10 @@ export function CustomAccessRequest() {
           {assumeAttempt.status === 'error' && (
             <Danger>{assumeAttempt.statusText}</Danger>
           )}
-          {createAttempt.status === 'success' && (
+          {submitOk && createAttempt.status === 'success' && (
             <Alert kind="success">
-              Request submitted. Wait for an approver, then refresh this table.
+              Request submitted. It will appear under My requests as Pending —
+              this list refreshes automatically.
             </Alert>
           )}
 
@@ -244,24 +322,27 @@ export function CustomAccessRequest() {
             {capsAttempt.status === 'success' &&
               requestableRoles.length === 0 && (
                 <Text color="text.muted">
-                  No requestable server roles are available for your user.
+                  No requestable server roles are available for your user. Ask an
+                  administrator to grant you an ssh-access-* requestable role.
                 </Text>
               )}
             {capsAttempt.status === 'success' &&
               requestableRoles.map(role => (
                 <Flex key={role} alignItems="center" gap={2} mb={2}>
-                  <input
-                    type="checkbox"
+                  <CheckboxInput
                     id={`role-${role}`}
                     checked={selectedRoles.includes(role)}
                     onChange={() => toggleRole(role)}
                   />
-                  <label htmlFor={`role-${role}`}>
-                    <Text>{serverNameFromRole(role)}</Text>
-                    <Text color="text.muted" fontSize={1}>
-                      {role}
-                    </Text>
-                  </label>
+                  <Box>
+                    <label
+                      htmlFor={`role-${role}`}
+                      style={{ cursor: 'pointer', fontWeight: 500 }}
+                    >
+                      {serverNameFromRole(role)}
+                    </label>
+                    <Subtle>{role}</Subtle>
+                  </Box>
                 </Flex>
               ))}
 
@@ -271,49 +352,51 @@ export function CustomAccessRequest() {
             <TextArea
               placeholder="Example: deploy hotfix for incident #123"
               value={reason}
-              onChange={(e: ChangeEvent<HTMLInputElement>) =>
-                setReason(e.target.value)
-              }
+              onChange={e => {
+                setSubmitOk(false);
+                setReason(e.target.value);
+              }}
               size="large"
             />
 
             <Text bold mt={3} mb={1}>
               Access duration
             </Text>
-            <DurationPicker>
-              {DURATION_OPTIONS.map(opt => (
-                <DurationButton
-                  key={opt.value}
-                  type="button"
-                  $active={durationPreset === opt.value}
-                  onClick={() => setDurationPreset(opt.value)}
-                >
-                  {opt.label}
-                </DurationButton>
-              ))}
-            </DurationPicker>
+            <ButtonSelect
+              options={DURATION_OPTIONS.map(o => ({
+                value: o.value,
+                label: o.label,
+              }))}
+              activeValue={durationPreset}
+              onChange={value => {
+                setSubmitOk(false);
+                setDurationPreset(value);
+              }}
+            />
 
             {durationPreset === 'custom' && (
-              <CustomDurationRow mt={2}>
-                <CustomDurationInput
-                  min={1}
-                  type="number"
-                  value={customDurationValue}
-                  onChange={(e: ChangeEvent<HTMLInputElement>) =>
-                    setCustomDurationValue(e.target.value)
-                  }
-                />
-                <CustomDurationSelect
-                  value={customDurationUnit}
-                  onChange={(e: ChangeEvent<HTMLSelectElement>) =>
-                    setCustomDurationUnit(e.target.value as DurationUnit)
-                  }
-                >
-                  <option value="minutes">minutes</option>
-                  <option value="hours">hours</option>
-                  <option value="days">days</option>
-                </CustomDurationSelect>
-              </CustomDurationRow>
+              <>
+                <Flex gap={2} alignItems="center" mt={2}>
+                  <Input
+                    type="number"
+                    min={1}
+                    max={MAX_CUSTOM_DURATION}
+                    width="120px"
+                    value={customDurationValue}
+                    onChange={e => setCustomDurationValue(e.target.value)}
+                  />
+                  <ButtonSelect
+                    options={UNIT_OPTIONS}
+                    activeValue={customDurationUnit}
+                    onChange={setCustomDurationUnit}
+                  />
+                </Flex>
+                {!durationValid && (
+                  <Text color="error.main" fontSize={1} mt={1}>
+                    Enter a number between 1 and {MAX_CUSTOM_DURATION}.
+                  </Text>
+                )}
+              </>
             )}
 
             <Box mt={4}>
@@ -329,31 +412,32 @@ export function CustomAccessRequest() {
             <Text bold fontSize={3}>
               My requests
             </Text>
-            <ButtonPrimary
+            <ButtonSecondary
               size="small"
               onClick={() => runFetchList()}
               disabled={listAttempt.status === 'processing'}
             >
               Refresh
-            </ButtonPrimary>
+            </ButtonSecondary>
           </Flex>
 
-          {listAttempt.status === 'processing' && (
-            <Box textAlign="center" m={4}>
-              <Indicator />
-            </Box>
-          )}
-          {listAttempt.status === 'error' && (
+          {listAttempt.status === 'error' && !listItems && (
             <Danger>{listAttempt.statusText}</Danger>
           )}
-          {listAttempt.status === 'success' && (
+          {listItems ? (
             <RequestsTable
-              items={listAttempt.data}
+              items={listItems}
               activeRequestId={activeRequestId}
               assumingRequestId={assumingRequestId}
               isAssuming={assumeAttempt.status === 'processing'}
               onAssume={onAssume}
             />
+          ) : (
+            listAttempt.status === 'processing' && (
+              <Box textAlign="center" m={4}>
+                <Indicator />
+              </Box>
+            )
           )}
         </>
       )}
@@ -364,48 +448,44 @@ export function CustomAccessRequest() {
             <Danger>{resolveAttempt.statusText}</Danger>
           )}
 
-          <Panel mb={3} p={3}>
-            <Text bold mb={1}>
-              Resolve reason
-            </Text>
-            <TextArea
-              placeholder="Optional reason for approve or deny"
-              value={resolveReason}
-              onChange={(e: ChangeEvent<HTMLInputElement>) =>
-                setResolveReason(e.target.value)
-              }
-              size="small"
-            />
-          </Panel>
-
           <Flex alignItems="center" justifyContent="space-between" mb={2}>
             <Text bold fontSize={3}>
               Pending approvals
             </Text>
-            <ButtonPrimary
+            <ButtonSecondary
               size="small"
               onClick={() => runFetchPending()}
               disabled={pendingAttempt.status === 'processing'}
             >
               Refresh
-            </ButtonPrimary>
+            </ButtonSecondary>
           </Flex>
 
-          {pendingAttempt.status === 'processing' && (
-            <Box textAlign="center" m={4}>
-              <Indicator />
-            </Box>
-          )}
-          {pendingAttempt.status === 'error' && (
+          {pendingAttempt.status === 'error' && !pendingItems && (
             <Danger>{pendingAttempt.statusText}</Danger>
           )}
-          {pendingAttempt.status === 'success' && (
+          {pendingItems ? (
             <PendingApprovalsTable
-              items={pendingAttempt.data}
+              items={pendingItems}
               resolvingRequestId={resolvingRequestId}
+              resolvingState={resolvingState}
               isResolving={resolveAttempt.status === 'processing'}
-              onResolve={onResolve}
+              confirmDenyId={confirmDenyId}
+              reasonById={resolveReasonById}
+              onReasonChange={(id, value) =>
+                setResolveReasonById(prev => ({ ...prev, [id]: value }))
+              }
+              onApprove={id => onResolve(id, 'APPROVED')}
+              onRequestDeny={id => setConfirmDenyId(id)}
+              onCancelDeny={() => setConfirmDenyId('')}
+              onConfirmDeny={id => onResolve(id, 'DENIED')}
             />
+          ) : (
+            pendingAttempt.status === 'processing' && (
+              <Box textAlign="center" m={4}>
+                <Indicator />
+              </Box>
+            )
           )}
         </>
       )}
@@ -426,114 +506,209 @@ function RequestsTable({
   isAssuming: boolean;
   onAssume(requestId: string): void;
 }) {
-  if (!items || items.length === 0) {
-    return <Text color="text.muted">No requests yet.</Text>;
-  }
-
   return (
-    <TableWrap>
-      <HeaderRow px={3} py={2}>
-        <Box flex="2">Server</Box>
-        <Box flex="1">State</Box>
-        <Box flex="2">Created</Box>
-        <Box flex="2">Expires</Box>
-        <Box flex="1">Action</Box>
-      </HeaderRow>
-      {items.map(req => {
-        const inUse = req.id === activeRequestId;
-        const canAssume = req.state === 'APPROVED' && !inUse;
-
-        return (
-          <DataRow key={req.id} px={3} py={2} alignItems="center">
-            <Box flex="2">
+    <Table<AccessRequest>
+      data={items}
+      emptyText="No requests yet. Select a server above and submit a request."
+      row={{ getKey: r => r.id }}
+      pagination={{ pageSize: 10 }}
+      columns={[
+        {
+          altKey: 'server',
+          headerText: 'Server',
+          render: req => (
+            <Cell>
               <Text>{serverNamesFromRoles(req.roles)}</Text>
-              <Text color="text.muted" fontSize={1}>
-                {(req.roles || []).join(', ')}
-              </Text>
-            </Box>
-            <Box flex="1">
-              <span style={{ color: stateColor(req.state), fontWeight: 600 }}>
-                {inUse ? 'IN USE' : req.state}
-              </span>
-            </Box>
-            <Box flex="2">{fmtDate(req.created)}</Box>
-            <Box flex="2">{fmtDate(req.expires)}</Box>
-            <Box flex="1">
-              {canAssume && (
-                <ButtonPrimary
-                  size="small"
-                  disabled={isAssuming}
-                  onClick={() => onAssume(req.id)}
-                >
-                  {isAssuming && assumingRequestId === req.id
-                    ? 'Using...'
-                    : 'Use access'}
-                </ButtonPrimary>
-              )}
-            </Box>
-          </DataRow>
-        );
-      })}
-    </TableWrap>
+              <Subtle>{(req.roles || []).join(', ')}</Subtle>
+            </Cell>
+          ),
+        },
+        {
+          altKey: 'state',
+          headerText: 'State',
+          render: req => {
+            const inUse = req.id === activeRequestId;
+            return (
+              <Cell>
+                <StateLabel $state={req.state}>
+                  {inUse ? 'IN USE' : req.state}
+                </StateLabel>
+                {req.resolveReason && (
+                  <Subtle>
+                    {req.state === 'DENIED' ? 'Denied' : 'Note'}:{' '}
+                    {req.resolveReason}
+                  </Subtle>
+                )}
+              </Cell>
+            );
+          },
+        },
+        {
+          altKey: 'reason',
+          headerText: 'Reason',
+          render: req => (
+            <Cell>
+              <Wrap>{req.reason || '-'}</Wrap>
+            </Cell>
+          ),
+        },
+        {
+          altKey: 'created',
+          headerText: 'Created',
+          render: req => <Cell>{fmtDate(req.created)}</Cell>,
+        },
+        {
+          altKey: 'expires',
+          headerText: 'Expires',
+          render: req => <Cell>{fmtExpires(req.expires)}</Cell>,
+        },
+        {
+          altKey: 'action',
+          headerText: 'Action',
+          render: req => {
+            const inUse = req.id === activeRequestId;
+            const canAssume = req.state === 'APPROVED' && !inUse;
+            return (
+              <Cell>
+                {canAssume && (
+                  <ButtonPrimary
+                    size="small"
+                    disabled={isAssuming}
+                    onClick={() => onAssume(req.id)}
+                  >
+                    {isAssuming && assumingRequestId === req.id
+                      ? 'Using...'
+                      : 'Use access'}
+                  </ButtonPrimary>
+                )}
+              </Cell>
+            );
+          },
+        },
+      ]}
+    />
   );
 }
 
 function PendingApprovalsTable({
   items,
   resolvingRequestId,
+  resolvingState,
   isResolving,
-  onResolve,
+  confirmDenyId,
+  reasonById,
+  onReasonChange,
+  onApprove,
+  onRequestDeny,
+  onCancelDeny,
+  onConfirmDeny,
 }: {
   items: AccessRequest[];
   resolvingRequestId: string;
+  resolvingState: ResolveState | '';
   isResolving: boolean;
-  onResolve(requestId: string, state: 'APPROVED' | 'DENIED'): void;
+  confirmDenyId: string;
+  reasonById: Record<string, string>;
+  onReasonChange(id: string, value: string): void;
+  onApprove(id: string): void;
+  onRequestDeny(id: string): void;
+  onCancelDeny(): void;
+  onConfirmDeny(id: string): void;
 }) {
-  if (!items || items.length === 0) {
-    return <Text color="text.muted">No pending approvals.</Text>;
-  }
-
   return (
-    <TableWrap>
-      <HeaderRow px={3} py={2}>
-        <Box flex="2">Server</Box>
-        <Box flex="1">Requester</Box>
-        <Box flex="2">Reason</Box>
-        <Box flex="2">Created</Box>
-        <Box flex="2">Actions</Box>
-      </HeaderRow>
-      {items.map(req => (
-        <DataRow key={req.id} px={3} py={2} alignItems="center">
-          <Box flex="2">
-            <Text>{serverNamesFromRoles(req.roles)}</Text>
-            <Text color="text.muted" fontSize={1}>
-              {(req.roles || []).join(', ')}
-            </Text>
-          </Box>
-          <Box flex="1">{req.user}</Box>
-          <Box flex="2">{req.reason || '-'}</Box>
-          <Box flex="2">{fmtDate(req.created)}</Box>
-          <Flex flex="2" gap={2}>
-            <ButtonPrimary
-              size="small"
-              disabled={isResolving}
-              onClick={() => onResolve(req.id, 'APPROVED')}
-            >
-              {isResolving && resolvingRequestId === req.id
-                ? 'Working...'
-                : 'Approve'}
-            </ButtonPrimary>
-            <ButtonSecondary
-              size="small"
-              disabled={isResolving}
-              onClick={() => onResolve(req.id, 'DENIED')}
-            >
-              Deny
-            </ButtonSecondary>
-          </Flex>
-        </DataRow>
-      ))}
-    </TableWrap>
+    <Table<AccessRequest>
+      data={items}
+      emptyText="No pending approvals. Requests awaiting your review appear here."
+      row={{ getKey: r => r.id }}
+      pagination={{ pageSize: 10 }}
+      columns={[
+        {
+          altKey: 'server',
+          headerText: 'Server',
+          render: req => (
+            <Cell>
+              <Text>{serverNamesFromRoles(req.roles)}</Text>
+              <Subtle>{(req.roles || []).join(', ')}</Subtle>
+            </Cell>
+          ),
+        },
+        {
+          altKey: 'requester',
+          headerText: 'Requester',
+          render: req => <Cell>{req.user}</Cell>,
+        },
+        {
+          altKey: 'reason',
+          headerText: 'Reason',
+          render: req => (
+            <Cell>
+              <Wrap>{req.reason || '-'}</Wrap>
+            </Cell>
+          ),
+        },
+        {
+          altKey: 'expires',
+          headerText: 'Expires',
+          render: req => <Cell>{fmtExpires(req.expires)}</Cell>,
+        },
+        {
+          altKey: 'decision',
+          headerText: 'Decision',
+          render: req => {
+            const busyThisRow = isResolving && resolvingRequestId === req.id;
+            const confirming = confirmDenyId === req.id;
+            return (
+              <Cell>
+                <Flex flexDirection="column" gap={2} minWidth="260px">
+                  <TextArea
+                    placeholder="Decision note (optional)"
+                    value={reasonById[req.id] || ''}
+                    onChange={e => onReasonChange(req.id, e.target.value)}
+                    size="small"
+                  />
+                  {confirming ? (
+                    <Flex gap={2} alignItems="center">
+                      <Text fontSize={1}>Deny this request?</Text>
+                      <ButtonSecondary
+                        size="small"
+                        disabled={isResolving}
+                        onClick={() => onConfirmDeny(req.id)}
+                      >
+                        {busyThisRow && resolvingState === 'DENIED'
+                          ? 'Denying...'
+                          : 'Confirm deny'}
+                      </ButtonSecondary>
+                      <ButtonSecondary size="small" onClick={onCancelDeny}>
+                        Cancel
+                      </ButtonSecondary>
+                    </Flex>
+                  ) : (
+                    <Flex gap={2}>
+                      <ButtonPrimary
+                        size="small"
+                        disabled={isResolving}
+                        onClick={() => onApprove(req.id)}
+                      >
+                        {busyThisRow && resolvingState === 'APPROVED'
+                          ? 'Approving...'
+                          : 'Approve'}
+                      </ButtonPrimary>
+                      <ButtonSecondary
+                        size="small"
+                        disabled={isResolving}
+                        onClick={() => onRequestDeny(req.id)}
+                      >
+                        Deny
+                      </ButtonSecondary>
+                    </Flex>
+                  )}
+                </Flex>
+              </Cell>
+            );
+          },
+        },
+      ]}
+    />
   );
 }
 
@@ -548,45 +723,64 @@ function serverNameFromRole(role: string): string {
   }
 
   const serverId = role.slice(SERVER_ACCESS_ROLE_PREFIX.length);
-  if (/^\d{1,3}(-\d{1,3}){3}$/.test(serverId)) {
+  // Only reconstruct an IP when every group is a valid 0-255 octet, so a
+  // dash-named server isn't mislabelled as an address.
+  const ipLike =
+    /^(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)-){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)$/;
+  if (ipLike.test(serverId)) {
     return serverId.replace(/-/g, '.');
   }
   return serverId;
 }
 
 function fmtDate(iso?: string): string {
-  if (!iso) {
+  const d = parseDate(iso);
+  return d ? d.toLocaleString() : '-';
+}
+
+function fmtExpires(iso?: string): string {
+  const d = parseDate(iso);
+  if (!d) {
     return '-';
+  }
+  const diffMs = d.getTime() - Date.now();
+  const rel = diffMs <= 0 ? 'expired' : `in ${fmtRelative(diffMs)}`;
+  return `${d.toLocaleString()} (${rel})`;
+}
+
+function parseDate(iso?: string): Date | undefined {
+  if (!iso) {
+    return undefined;
   }
   const d = new Date(iso);
   if (isNaN(d.getTime()) || d.getFullYear() < 2000) {
-    return '-';
+    return undefined;
   }
-  return d.toLocaleString();
+  return d;
 }
 
-function stateColor(state: string): string {
-  switch (state) {
-    case 'APPROVED':
-      return '#36c98c';
-    case 'DENIED':
-      return '#e96f6f';
-    case 'PENDING':
-      return '#f5a623';
-    default:
-      return 'inherit';
+function fmtRelative(ms: number): string {
+  // Floor so a "time remaining" hint never overstates how long is left.
+  const mins = Math.floor(ms / 60000);
+  if (mins < 1) {
+    return '<1m';
   }
+  if (mins < 60) {
+    return `${mins}m`;
+  }
+  const hours = Math.floor(mins / 60);
+  if (hours < 48) {
+    return `${hours}h`;
+  }
+  return `${Math.floor(hours / 24)}d`;
 }
 
-function isDurationValid(
-  preset: DurationPreset,
-  customValue: string
-): boolean {
+function isDurationValid(preset: DurationPreset, customValue: string): boolean {
   if (preset !== 'custom') {
     return true;
   }
-
-  return Number(customValue) > 0;
+  const n = Number(customValue);
+  return Number.isFinite(n) && n > 0 && n <= MAX_CUSTOM_DURATION;
 }
 
 function getDurationMs(
@@ -617,63 +811,6 @@ function getDurationMs(
   }
 }
 
-const TabBar = styled(Flex)`
-  gap: 8px;
-`;
-
-const TabButton = styled.button<{ $active: boolean }>`
-  background: ${p => (p.$active ? p.theme.colors.spotBackground[0] : 'none')};
-  border: 1px solid
-    ${p => (p.$active ? '#512fc9' : p.theme.colors.spotBackground[1])};
-  border-radius: 6px;
-  color: inherit;
-  cursor: pointer;
-  font-weight: ${p => (p.$active ? 700 : 500)};
-  padding: 8px 12px;
-`;
-
-const DurationPicker = styled(Flex)`
-  flex-wrap: wrap;
-  gap: 8px;
-`;
-
-const DurationButton = styled.button<{ $active: boolean }>`
-  background: ${p => (p.$active ? p.theme.colors.spotBackground[0] : 'none')};
-  border: 1px solid
-    ${p => (p.$active ? '#512fc9' : p.theme.colors.spotBackground[1])};
-  border-radius: 6px;
-  color: inherit;
-  cursor: pointer;
-  font-weight: ${p => (p.$active ? 700 : 500)};
-  min-width: 72px;
-  padding: 8px 12px;
-`;
-
-const CustomDurationRow = styled(Flex)`
-  align-items: center;
-  gap: 8px;
-`;
-
-const CustomDurationInput = styled.input`
-  background: transparent;
-  border: 1px solid ${p => p.theme.colors.spotBackground[1]};
-  border-radius: 4px;
-  color: inherit;
-  height: 34px;
-  padding: 0 10px;
-  width: 88px;
-`;
-
-const CustomDurationSelect = styled.select`
-  background: transparent;
-  border: 1px solid ${p => p.theme.colors.spotBackground[1]};
-  border-radius: 4px;
-  color: inherit;
-  height: 34px;
-  min-width: 120px;
-  padding: 0 8px;
-`;
-
 const ScrollableFeatureBox = styled(FeatureBox)`
   box-sizing: border-box;
   height: calc(100vh - ${p => p.theme.topBarHeight[0]}px);
@@ -690,23 +827,28 @@ const ScrollableFeatureBox = styled(FeatureBox)`
 
 const Panel = styled(Box)`
   border: 1px solid ${p => p.theme.colors.spotBackground[1]};
-  border-radius: 8px;
+  border-radius: ${p => p.theme.radii[3]}px;
   max-width: 720px;
 `;
 
-const TableWrap = styled(Box)`
-  border: 1px solid ${p => p.theme.colors.spotBackground[1]};
-  border-radius: 8px;
-  overflow-x: auto;
-  overflow-y: visible;
-  max-width: 1120px;
+const StateLabel = styled(Text)<{ $state: string }>`
+  font-weight: 600;
+  color: ${p =>
+    p.$state === 'APPROVED'
+      ? p.theme.colors.success.main
+      : p.$state === 'DENIED'
+        ? p.theme.colors.error.main
+        : p.$state === 'PENDING'
+          ? p.theme.colors.warning.main
+          : 'inherit'};
 `;
 
-const HeaderRow = styled(Flex)`
-  background: ${p => p.theme.colors.spotBackground[0]};
-  font-weight: bold;
+const Subtle = styled(Text)`
+  color: ${p => p.theme.colors.text.muted};
+  font-size: ${p => p.theme.fontSizes[1]}px;
+  overflow-wrap: anywhere;
 `;
 
-const DataRow = styled(Flex)`
-  border-top: 1px solid ${p => p.theme.colors.spotBackground[0]};
+const Wrap = styled(Text)`
+  overflow-wrap: anywhere;
 `;
