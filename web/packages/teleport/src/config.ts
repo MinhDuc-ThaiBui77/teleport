@@ -356,6 +356,10 @@ const cfg = {
       '/v1/webapi/sites/:clusterId/accessrequests/pending',
     accessRequestsCustomResolvePath:
       '/v1/webapi/sites/:clusterId/accessrequests/resolve/:requestId',
+    accessRequestsCustomApprovedPath:
+      '/v1/webapi/sites/:clusterId/accessrequests/approved',
+    accessRequestsCustomRevokePath:
+      '/v1/webapi/sites/:clusterId/accessrequests/revoke/:requestId',
 
     gitServer: {
       createOrOverwrite: '/v1/webapi/sites/:clusterId/gitservers',
@@ -1289,6 +1293,19 @@ const cfg = {
 
   getAccessRequestsCustomResolveUrl(clusterId: string, requestId: string) {
     return generatePath(cfg.api.accessRequestsCustomResolvePath, {
+      clusterId,
+      requestId,
+    });
+  },
+
+  getAccessRequestsCustomApprovedUrl(clusterId: string) {
+    return generatePath(cfg.api.accessRequestsCustomApprovedPath, {
+      clusterId,
+    });
+  },
+
+  getAccessRequestsCustomRevokeUrl(clusterId: string, requestId: string) {
+    return generatePath(cfg.api.accessRequestsCustomRevokePath, {
       clusterId,
       requestId,
     });

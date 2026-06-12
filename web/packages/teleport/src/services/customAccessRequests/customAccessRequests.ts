@@ -36,6 +36,8 @@ export type CustomAccessRequest = {
   created: string;
   expires: string;
   maxDuration: string;
+  /** True when an in-force lock targets this request (approved-grants view). */
+  revoked?: boolean;
 };
 
 export type CustomAccessRequestCapabilities = {
@@ -71,6 +73,7 @@ function makeAccessRequest(json: any): CustomAccessRequest {
     created: json.created,
     expires: json.expires,
     maxDuration: json.maxDuration,
+    revoked: json.revoked,
   };
 }
 
@@ -126,4 +129,24 @@ export function resolveCustomAccessRequest(
 
 export function assumeCustomAccessRequest(requestId: string): Promise<Date> {
   return websession.renewSession({ requestId });
+}
+
+export function fetchApprovedCustomAccessRequests(
+  clusterId: string,
+  signal?: AbortSignal
+): Promise<CustomAccessRequest[]> {
+  return api
+    .get(cfg.getAccessRequestsCustomApprovedUrl(clusterId), signal)
+    .then(json => (json?.items ?? []).map(makeAccessRequest));
+}
+
+// revokeCustomAccessRequest revokes an approved grant by locking the request
+// itself (server side), dropping only the access that request granted.
+export function revokeCustomAccessRequest(
+  clusterId: string,
+  requestId: string
+): Promise<CustomAccessRequest> {
+  return api
+    .post(cfg.getAccessRequestsCustomRevokeUrl(clusterId, requestId), {})
+    .then(makeAccessRequest);
 }

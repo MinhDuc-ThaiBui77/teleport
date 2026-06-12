@@ -19,10 +19,12 @@
 export {
   assumeCustomAccessRequest,
   createCustomAccessRequest,
+  fetchApprovedCustomAccessRequests,
   fetchCustomAccessRequestCapabilities,
   fetchMyCustomAccessRequests,
   fetchPendingCustomAccessRequests,
   resolveCustomAccessRequest,
+  revokeCustomAccessRequest,
 } from './customAccessRequests';
 export type {
   CreateCustomAccessRequestParams,

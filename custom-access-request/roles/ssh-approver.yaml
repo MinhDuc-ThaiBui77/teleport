@@ -15,3 +15,9 @@ spec:
       - resources: [access_request]
         # 'update' = approve/deny via SetAccessRequestState.
         verbs: [list, read, update]
+      # Needed to REVOKE an active grant from the GUI: revoking creates a lock
+      # targeting the access request (LockTarget.AccessRequest), which drops only
+      # that request's elevated access — it does NOT lock the user. The lock
+      # expires when the request would expire, so it self-cleans.
+      - resources: [lock]
+        verbs: [create, list, read]

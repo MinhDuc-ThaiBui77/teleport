@@ -16,6 +16,8 @@ Routes registered in `lib/web/apiserver.go`:
 | `GET` | `/webapi/sites/:site/accessrequests/capabilities` | Return requestable roles |
 | `GET` | `/webapi/sites/:site/accessrequests/pending` | List pending custom server-access requests for approvers |
 | `POST` | `/webapi/sites/:site/accessrequests/resolve/:request_id` | Approve or deny a request |
+| `GET` | `/webapi/sites/:site/accessrequests/approved` | List approved "active grants" (marks ones already revoked) |
+| `POST` | `/webapi/sites/:site/accessrequests/revoke/:request_id` | Revoke an active grant by locking the request |
 
 The frontend calls these through `/v1/webapi/...`; the proxy strips `/v1`.
 
@@ -25,6 +27,18 @@ Community-safe auth client methods used:
 - `GetAccessRequests`
 - `GetAccessCapabilities`
 - `SetAccessRequestState`
+- `UpsertLock` / `GetLocks` (revoke an active grant — see below)
+
+### Revoking an active grant (without locking the user)
+
+Revoke creates a **lock targeting the access request** (`LockTarget.AccessRequest
+= <request id>`), via `UpsertLock`. This drops only the elevated access that
+request granted — the user's normal access is untouched and they are NOT locked
+out as a user. The lock's `Expires` is set to the request's own access expiry so
+it **self-cleans** (no permanent lock garbage); re-access is a brand-new request.
+Locks are OSS (the web API already exposes `createClusterLock`). Approvers need
+`lock` `create`/`list`/`read` RBAC — added to the `ssh-approver` role. Note:
+deleting a request does NOT revoke an already-issued cert; only a lock does.
 
 Approval and denial deliberately use `SetAccessRequestState`, the same primitive
 used by `tctl requests approve|deny`. The code does not use

@@ -50,10 +50,12 @@ import {
   type CustomAccessRequest as AccessRequest,
   assumeCustomAccessRequest,
   createCustomAccessRequest,
+  fetchApprovedCustomAccessRequests,
   fetchCustomAccessRequestCapabilities,
   fetchMyCustomAccessRequests,
   fetchPendingCustomAccessRequests,
   resolveCustomAccessRequest,
+  revokeCustomAccessRequest,
 } from 'teleport/services/customAccessRequests';
 import history from 'teleport/services/history';
 import useStickyClusterId from 'teleport/useStickyClusterId';
@@ -129,6 +131,15 @@ export function CustomAccessRequest() {
       [clusterId]
     )
   );
+  const [approvedAttempt, runFetchApproved] = useAsync(
+    useCallback(() => fetchApprovedCustomAccessRequests(clusterId), [clusterId])
+  );
+  const [revokeAttempt, runRevoke, setRevokeAttempt] = useAsync(
+    useCallback(
+      (requestId: string) => revokeCustomAccessRequest(clusterId, requestId),
+      [clusterId]
+    )
+  );
 
   const [activeTab, setActiveTab] = useState<TabKey>('request');
   const [submitOk, setSubmitOk] = useState(false);
@@ -142,6 +153,8 @@ export function CustomAccessRequest() {
   const [resolvingRequestId, setResolvingRequestId] = useState('');
   const [resolvingState, setResolvingState] = useState<ResolveState | ''>('');
   const [confirmDenyId, setConfirmDenyId] = useState('');
+  const [revokingRequestId, setRevokingRequestId] = useState('');
+  const [confirmRevokeId, setConfirmRevokeId] = useState('');
   // Per-row approver note so a reason typed for one request can never attach to
   // another.
   const [resolveReasonById, setResolveReasonById] = useState<
@@ -154,6 +167,7 @@ export function CustomAccessRequest() {
     runFetchList();
     if (canResolveRequests) {
       runFetchPending();
+      runFetchApproved();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [clusterId, canResolveRequests]);
@@ -169,19 +183,28 @@ export function CustomAccessRequest() {
         runFetchList();
       } else if (activeTab === 'approvals' && canResolveRequests) {
         runFetchPending();
+        runFetchApproved();
       }
     }, POLL_INTERVAL_MS);
     return () => window.clearInterval(id);
-  }, [activeTab, canResolveRequests, runFetchList, runFetchPending]);
+  }, [
+    activeTab,
+    canResolveRequests,
+    runFetchList,
+    runFetchPending,
+    runFetchApproved,
+  ]);
 
   function switchTab(tab: TabKey) {
     setActiveTab(tab);
     setSubmitOk(false);
     setConfirmDenyId('');
+    setConfirmRevokeId('');
     // Clear any stale action banners so they don't reappear on revisit.
     setCreateAttempt(makeEmptyAttempt());
     setAssumeAttempt(makeEmptyAttempt());
     setResolveAttempt(makeEmptyAttempt());
+    setRevokeAttempt(makeEmptyAttempt());
   }
 
   function toggleRole(role: string) {
@@ -237,6 +260,17 @@ export function CustomAccessRequest() {
       });
       runFetchPending();
       runFetchList();
+      runFetchApproved();
+    }
+  }
+
+  async function onRevoke(requestId: string) {
+    setConfirmRevokeId('');
+    setRevokingRequestId(requestId);
+    const [, err] = await runRevoke(requestId);
+    setRevokingRequestId('');
+    if (!err) {
+      runFetchApproved();
     }
   }
 
@@ -263,6 +297,12 @@ export function CustomAccessRequest() {
     lastPendingRef.current = pendingAttempt.data;
   }
   const pendingItems = pendingAttempt.data ?? lastPendingRef.current;
+
+  const lastApprovedRef = useRef<AccessRequest[] | undefined>(undefined);
+  if (approvedAttempt.data) {
+    lastApprovedRef.current = approvedAttempt.data;
+  }
+  const approvedItems = approvedAttempt.data ?? lastApprovedRef.current;
 
   const tabs: { key: TabKey; title: string }[] = [
     { key: 'request', title: 'Request access' },
@@ -482,6 +522,49 @@ export function CustomAccessRequest() {
             />
           ) : (
             pendingAttempt.status === 'processing' && (
+              <Box textAlign="center" m={4}>
+                <Indicator />
+              </Box>
+            )
+          )}
+
+          {revokeAttempt.status === 'error' && (
+            <Danger>{revokeAttempt.statusText}</Danger>
+          )}
+
+          <Flex
+            alignItems="center"
+            justifyContent="space-between"
+            mb={2}
+            mt={4}
+          >
+            <Text bold fontSize={3}>
+              Active grants
+            </Text>
+            <ButtonSecondary
+              size="small"
+              onClick={() => runFetchApproved()}
+              disabled={approvedAttempt.status === 'processing'}
+            >
+              Refresh
+            </ButtonSecondary>
+          </Flex>
+
+          {approvedAttempt.status === 'error' && !approvedItems && (
+            <Danger>{approvedAttempt.statusText}</Danger>
+          )}
+          {approvedItems ? (
+            <ActiveGrantsTable
+              items={approvedItems}
+              revokingRequestId={revokingRequestId}
+              isRevoking={revokeAttempt.status === 'processing'}
+              confirmRevokeId={confirmRevokeId}
+              onRequestRevoke={id => setConfirmRevokeId(id)}
+              onCancelRevoke={() => setConfirmRevokeId('')}
+              onConfirmRevoke={onRevoke}
+            />
+          ) : (
+            approvedAttempt.status === 'processing' && (
               <Box textAlign="center" m={4}>
                 <Indicator />
               </Box>
@@ -709,6 +792,107 @@ function PendingApprovalsTable({
                     </Flex>
                   )}
                 </Flex>
+              </Cell>
+            );
+          },
+        },
+      ]}
+    />
+  );
+}
+
+function ActiveGrantsTable({
+  items,
+  revokingRequestId,
+  isRevoking,
+  confirmRevokeId,
+  onRequestRevoke,
+  onCancelRevoke,
+  onConfirmRevoke,
+}: {
+  items: AccessRequest[];
+  revokingRequestId: string;
+  isRevoking: boolean;
+  confirmRevokeId: string;
+  onRequestRevoke(id: string): void;
+  onCancelRevoke(): void;
+  onConfirmRevoke(id: string): void;
+}) {
+  return (
+    <Table<AccessRequest>
+      data={items}
+      emptyText="No active grants. Approved requests appear here while in use."
+      searchableProps={['state', 'user']}
+      row={{ getKey: r => r.id }}
+      pagination={{ pageSize: 10 }}
+      columns={[
+        {
+          altKey: 'server',
+          headerText: 'Server',
+          render: req => (
+            <Cell>
+              <Text>{serverNamesFromRoles(req.roles)}</Text>
+              <Subtle>{(req.roles || []).join(', ')}</Subtle>
+            </Cell>
+          ),
+        },
+        {
+          altKey: 'requester',
+          headerText: 'Requester',
+          render: req => <Cell>{req.user}</Cell>,
+        },
+        {
+          altKey: 'expires',
+          headerText: 'Granted until',
+          render: req => <Cell>{fmtExpires(req.expires)}</Cell>,
+        },
+        {
+          altKey: 'status',
+          headerText: 'Status',
+          render: req => (
+            <Cell>
+              {req.revoked ? (
+                <Subtle>Revoked</Subtle>
+              ) : (
+                <StateLabel $state="APPROVED">Active</StateLabel>
+              )}
+            </Cell>
+          ),
+        },
+        {
+          altKey: 'action',
+          headerText: 'Action',
+          render: req => {
+            if (req.revoked) {
+              return <Cell />;
+            }
+            const confirming = confirmRevokeId === req.id;
+            const busy = isRevoking && revokingRequestId === req.id;
+            return (
+              <Cell>
+                {confirming ? (
+                  <Flex gap={2} alignItems="center">
+                    <Text fontSize={1}>Revoke access?</Text>
+                    <ButtonSecondary
+                      size="small"
+                      disabled={isRevoking}
+                      onClick={() => onConfirmRevoke(req.id)}
+                    >
+                      {busy ? 'Revoking...' : 'Confirm'}
+                    </ButtonSecondary>
+                    <ButtonSecondary size="small" onClick={onCancelRevoke}>
+                      Cancel
+                    </ButtonSecondary>
+                  </Flex>
+                ) : (
+                  <ButtonSecondary
+                    size="small"
+                    disabled={isRevoking}
+                    onClick={() => onRequestRevoke(req.id)}
+                  >
+                    Revoke access
+                  </ButtonSecondary>
+                )}
               </Cell>
             );
           },

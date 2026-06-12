@@ -32,6 +32,7 @@
 package web
 
 import (
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -85,6 +86,9 @@ type accessRequestInfo struct {
 	Created       time.Time `json:"created"`
 	Expires       time.Time `json:"expires"`
 	MaxDuration   time.Time `json:"maxDuration"`
+	// Revoked is true when an in-force lock targets this request. Only set by
+	// the approved-grants listing.
+	Revoked bool `json:"revoked,omitempty"`
 }
 
 func makeAccessRequestInfo(req types.AccessRequest) accessRequestInfo {
@@ -325,6 +329,116 @@ func (h *Handler) resolveAccessRequest(w http.ResponseWriter, r *http.Request, p
 	}
 
 	return makeAccessRequestInfo(updated[0]), nil
+}
+
+// listApprovedAccessRequests returns approved custom server-access requests
+// ("active grants") so approvers can see and revoke them. Each item is marked
+// as revoked when an in-force lock already targets it.
+//
+// GET /webapi/sites/:site/accessrequests/approved
+func (h *Handler) listApprovedAccessRequests(w http.ResponseWriter, r *http.Request, p httprouter.Params, sctx *SessionContext, cluster reversetunnelclient.Cluster) (any, error) {
+	ctx := r.Context()
+
+	clt, err := sctx.GetUserClient(ctx, cluster)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	reqs, err := clt.GetAccessRequests(ctx, types.AccessRequestFilter{
+		State: types.RequestState_APPROVED,
+	})
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	// Build the set of access requests that currently have an in-force lock so
+	// the UI can show which grants are already revoked.
+	revoked := make(map[string]bool)
+	locks, err := clt.GetLocks(ctx, true)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	for _, lock := range locks {
+		if id := lock.Target().AccessRequest; id != "" {
+			revoked[id] = true
+		}
+	}
+
+	items := make([]accessRequestInfo, 0, len(reqs))
+	for _, req := range reqs {
+		if !isCustomServerAccessRequest(req) {
+			continue
+		}
+		info := makeAccessRequestInfo(req)
+		info.Revoked = revoked[req.GetName()]
+		items = append(items, info)
+	}
+
+	return listAccessRequestsResponse{Items: items}, nil
+}
+
+// revokeAccessRequest revokes an approved server-access request by creating a
+// lock that targets the request itself (LockTarget.AccessRequest). This drops
+// only the elevated access granted by that request — the user's normal access
+// is unaffected, and they are NOT locked out as a user. The lock expires when
+// the granted access would expire anyway, so it self-cleans rather than leaving
+// a permanent lock behind.
+//
+// POST /webapi/sites/:site/accessrequests/revoke/:request_id
+func (h *Handler) revokeAccessRequest(w http.ResponseWriter, r *http.Request, p httprouter.Params, sctx *SessionContext, cluster reversetunnelclient.Cluster) (any, error) {
+	ctx := r.Context()
+
+	requestID := p.ByName("request_id")
+	if requestID == "" {
+		return nil, trace.BadParameter("missing request id")
+	}
+
+	clt, err := sctx.GetUserClient(ctx, cluster)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	found, err := clt.GetAccessRequests(ctx, types.AccessRequestFilter{
+		ID: requestID,
+	})
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	if len(found) != 1 {
+		return nil, trace.NotFound("access request %q not found", requestID)
+	}
+	if !isCustomServerAccessRequest(found[0]) {
+		return nil, trace.BadParameter("access request %q is not a custom server-access request", requestID)
+	}
+
+	// Expire the lock when the granted access would expire anyway so it
+	// self-cleans. Fall back to a bounded TTL if the request expiry is missing.
+	expires := found[0].GetAccessExpiry().UTC()
+	now := h.clock.Now().UTC()
+	if expires.IsZero() || !expires.After(now) {
+		expires = now.Add(24 * time.Hour)
+	}
+
+	lock, err := types.NewLock(customRevokeLockName(requestID), types.LockSpecV2{
+		Target:  types.LockTarget{AccessRequest: requestID},
+		Message: fmt.Sprintf("Server-access request %s revoked by %s", requestID, sctx.GetUser()),
+		Expires: &expires,
+	})
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	if err := clt.UpsertLock(ctx, lock); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	info := makeAccessRequestInfo(found[0])
+	info.Revoked = true
+	return info, nil
+}
+
+func customRevokeLockName(requestID string) string {
+	return "ssh-access-revoke-" + requestID
 }
 
 // getAccessRequestCapabilities returns the roles the current user is allowed to
