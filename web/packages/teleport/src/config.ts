@@ -360,6 +360,8 @@ const cfg = {
       '/v1/webapi/sites/:clusterId/accessrequests/approved',
     accessRequestsCustomRevokePath:
       '/v1/webapi/sites/:clusterId/accessrequests/revoke/:requestId',
+    accessRequestsCustomRestorePath:
+      '/v1/webapi/sites/:clusterId/accessrequests/restore/:requestId',
 
     gitServer: {
       createOrOverwrite: '/v1/webapi/sites/:clusterId/gitservers',
@@ -1306,6 +1308,13 @@ const cfg = {
 
   getAccessRequestsCustomRevokeUrl(clusterId: string, requestId: string) {
     return generatePath(cfg.api.accessRequestsCustomRevokePath, {
+      clusterId,
+      requestId,
+    });
+  },
+
+  getAccessRequestsCustomRestoreUrl(clusterId: string, requestId: string) {
+    return generatePath(cfg.api.accessRequestsCustomRestorePath, {
       clusterId,
       requestId,
     });

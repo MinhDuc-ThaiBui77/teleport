@@ -441,6 +441,31 @@ func customRevokeLockName(requestID string) string {
 	return "ssh-access-revoke-" + requestID
 }
 
+// restoreAccessRequest removes the revoke lock for a request, restoring the
+// access that revoke had dropped. Idempotent: a missing lock is treated as
+// already-restored.
+//
+// POST /webapi/sites/:site/accessrequests/restore/:request_id
+func (h *Handler) restoreAccessRequest(w http.ResponseWriter, r *http.Request, p httprouter.Params, sctx *SessionContext, cluster reversetunnelclient.Cluster) (any, error) {
+	ctx := r.Context()
+
+	requestID := p.ByName("request_id")
+	if requestID == "" {
+		return nil, trace.BadParameter("missing request id")
+	}
+
+	clt, err := sctx.GetUserClient(ctx, cluster)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	if err := clt.DeleteLock(ctx, customRevokeLockName(requestID)); err != nil && !trace.IsNotFound(err) {
+		return nil, trace.Wrap(err)
+	}
+
+	return OK(), nil
+}
+
 // getAccessRequestCapabilities returns the roles the current user is allowed to
 // request, so the UI can populate its picker.
 //

@@ -69,6 +69,16 @@ export function parseProxyVersion(json): ProxyVersion | undefined {
   return json?.fields?.proxyVersion;
 }
 
+/**
+ * Returns the in-force lock when the error is a "lock targeting ... is in force"
+ * AccessDenied. The backend attaches the lock under fields['lock-in-force']
+ * (same wire mechanism as proxyVersion — see lib/services/lock.go
+ * LockInForceAccessDenied).
+ */
+export function parseLockInForce(json): unknown | undefined {
+  return json?.fields?.['lock-in-force'];
+}
+
 export class ApiError extends Error {
   response: Response;
   /**

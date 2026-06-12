@@ -24,6 +24,7 @@ export {
   fetchMyCustomAccessRequests,
   fetchPendingCustomAccessRequests,
   resolveCustomAccessRequest,
+  restoreCustomAccessRequest,
   revokeCustomAccessRequest,
 } from './customAccessRequests';
 export type {

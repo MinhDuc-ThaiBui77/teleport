@@ -22,7 +22,11 @@ import websession from 'teleport/services/websession';
 
 import { MfaChallengeResponse } from '../mfa';
 import { storageService } from '../storageService';
-import parseError, { ApiError, parseProxyVersion } from './parseError';
+import parseError, {
+  ApiError,
+  parseLockInForce,
+  parseProxyVersion,
+} from './parseError';
 
 export const MFA_HEADER = 'Teleport-Mfa-Response';
 
@@ -310,6 +314,22 @@ const api = {
       return;
     }
 
+    /**
+     * The user's whole session is locked (e.g. an approver revoked their
+     * access request). Web JSON requests pass through Authorize, which only
+     * checks identity-scoped lock targets (User/Role/AccessRequest/MFA/Device —
+     * never a single resource), so a lock-in-force here always means the
+     * session is locked. Send them back to login to re-authenticate to their
+     * base access instead of getting stuck on access-denied.
+     */
+    if (isLockInForceError(json)) {
+      websession.logoutWithoutSlo({
+        rememberLocation: false,
+        withAccessChangedMessage: true,
+      });
+      return;
+    }
+
     throw new ApiError({
       message: parseError(json),
       response,
@@ -461,6 +481,19 @@ export function isUserSessionRoleNotFoundError(json: any): boolean {
   // Keep in sync with lib/services/role.go(UserSessionRoleNotFoundError)
   return (
     !!json.error && !!json?.messages?.includes('user session role not found')
+  );
+}
+
+/**
+ * isLockInForceError returns true if the error is a "lock in force" AccessDenied.
+ * Keep in sync with lib/services/lock.go (LockInForceAccessDenied), which sets
+ * the fields['lock-in-force'] marker and a "... is in force" message.
+ */
+export function isLockInForceError(json: any): boolean {
+  const message = json?.error?.message || json?.message || '';
+  return (
+    !!parseLockInForce(json) ||
+    (typeof message === 'string' && message.includes('is in force'))
   );
 }
 

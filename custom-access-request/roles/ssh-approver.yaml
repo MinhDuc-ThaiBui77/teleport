@@ -19,5 +19,6 @@ spec:
       # targeting the access request (LockTarget.AccessRequest), which drops only
       # that request's elevated access — it does NOT lock the user. The lock
       # expires when the request would expire, so it self-cleans.
+      # create = revoke (lock the request); delete = restore (remove the lock).
       - resources: [lock]
-        verbs: [create, list, read]
+        verbs: [create, list, read, delete]

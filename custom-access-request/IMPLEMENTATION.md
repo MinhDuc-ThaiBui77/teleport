@@ -18,6 +18,7 @@ Routes registered in `lib/web/apiserver.go`:
 | `POST` | `/webapi/sites/:site/accessrequests/resolve/:request_id` | Approve or deny a request |
 | `GET` | `/webapi/sites/:site/accessrequests/approved` | List approved "active grants" (marks ones already revoked) |
 | `POST` | `/webapi/sites/:site/accessrequests/revoke/:request_id` | Revoke an active grant by locking the request |
+| `POST` | `/webapi/sites/:site/accessrequests/restore/:request_id` | Restore (remove the revoke lock) |
 
 The frontend calls these through `/v1/webapi/...`; the proxy strips `/v1`.
 
@@ -27,7 +28,7 @@ Community-safe auth client methods used:
 - `GetAccessRequests`
 - `GetAccessCapabilities`
 - `SetAccessRequestState`
-- `UpsertLock` / `GetLocks` (revoke an active grant — see below)
+- `UpsertLock` / `GetLocks` / `DeleteLock` (revoke / restore a grant — see below)
 
 ### Revoking an active grant (without locking the user)
 
@@ -37,8 +38,21 @@ request granted — the user's normal access is untouched and they are NOT locke
 out as a user. The lock's `Expires` is set to the request's own access expiry so
 it **self-cleans** (no permanent lock garbage); re-access is a brand-new request.
 Locks are OSS (the web API already exposes `createClusterLock`). Approvers need
-`lock` `create`/`list`/`read` RBAC — added to the `ssh-approver` role. Note:
-deleting a request does NOT revoke an already-issued cert; only a lock does.
+`lock` `create`/`list`/`read`/`delete` RBAC — added to the `ssh-approver` role
+(`delete` is for Restore). Note: deleting a request does NOT revoke an
+already-issued cert; only a lock does.
+
+**Graceful lockout (core change).** Because the GUI "Use access" elevates the
+whole web session (`renewSession`), revoking locks that session — every web
+request then 403s with a lock-in-force. To avoid the user getting stuck on
+"access denied", `web/packages/teleport/src/services/api/api.ts` now detects a
+lock-in-force error (via `parseLockInForce` reading `fields['lock-in-force']`,
+the same wire mechanism as `proxyVersion`) and calls
+`websession.logoutWithoutSlo({withAccessChangedMessage:true})` — mirroring the
+existing `isUserSessionRoleNotFoundError` auto-logout. The user is bounced to the
+login page and logs back in to their base access. This is safe because web JSON
+requests pass through `Authorize`, which only checks identity-scoped lock targets
+(never single-resource/node locks). "Restore" removes the lock from the GUI.
 
 Approval and denial deliberately use `SetAccessRequestState`, the same primitive
 used by `tctl requests approve|deny`. The code does not use

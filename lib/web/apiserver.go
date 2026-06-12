@@ -956,6 +956,7 @@ func (h *Handler) bindDefaultEndpoints() {
 	h.POST("/webapi/sites/:site/accessrequests/resolve/:request_id", h.WithClusterAuth(h.resolveAccessRequest))
 	h.GET("/webapi/sites/:site/accessrequests/approved", h.WithClusterAuth(h.listApprovedAccessRequests))
 	h.POST("/webapi/sites/:site/accessrequests/revoke/:request_id", h.WithClusterAuth(h.revokeAccessRequest))
+	h.POST("/webapi/sites/:site/accessrequests/restore/:request_id", h.WithClusterAuth(h.restoreAccessRequest))
 
 	// active sessions handlers
 	h.GET("/webapi/sites/:site/connect/ws", h.WithClusterAuthWebSocket(h.siteNodeConnect))         // connect to an active session (via websocket, with auth over websocket)

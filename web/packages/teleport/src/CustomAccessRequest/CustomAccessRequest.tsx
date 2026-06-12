@@ -55,6 +55,7 @@ import {
   fetchMyCustomAccessRequests,
   fetchPendingCustomAccessRequests,
   resolveCustomAccessRequest,
+  restoreCustomAccessRequest,
   revokeCustomAccessRequest,
 } from 'teleport/services/customAccessRequests';
 import history from 'teleport/services/history';
@@ -140,6 +141,12 @@ export function CustomAccessRequest() {
       [clusterId]
     )
   );
+  const [restoreAttempt, runRestore] = useAsync(
+    useCallback(
+      (requestId: string) => restoreCustomAccessRequest(clusterId, requestId),
+      [clusterId]
+    )
+  );
 
   const [activeTab, setActiveTab] = useState<TabKey>('request');
   const [submitOk, setSubmitOk] = useState(false);
@@ -155,6 +162,7 @@ export function CustomAccessRequest() {
   const [confirmDenyId, setConfirmDenyId] = useState('');
   const [revokingRequestId, setRevokingRequestId] = useState('');
   const [confirmRevokeId, setConfirmRevokeId] = useState('');
+  const [restoringRequestId, setRestoringRequestId] = useState('');
   // Per-row approver note so a reason typed for one request can never attach to
   // another.
   const [resolveReasonById, setResolveReasonById] = useState<
@@ -269,6 +277,15 @@ export function CustomAccessRequest() {
     setRevokingRequestId(requestId);
     const [, err] = await runRevoke(requestId);
     setRevokingRequestId('');
+    if (!err) {
+      runFetchApproved();
+    }
+  }
+
+  async function onRestore(requestId: string) {
+    setRestoringRequestId(requestId);
+    const [, err] = await runRestore(requestId);
+    setRestoringRequestId('');
     if (!err) {
       runFetchApproved();
     }
@@ -531,6 +548,9 @@ export function CustomAccessRequest() {
           {revokeAttempt.status === 'error' && (
             <Danger>{revokeAttempt.statusText}</Danger>
           )}
+          {restoreAttempt.status === 'error' && (
+            <Danger>{restoreAttempt.statusText}</Danger>
+          )}
 
           <Flex
             alignItems="center"
@@ -559,9 +579,12 @@ export function CustomAccessRequest() {
               revokingRequestId={revokingRequestId}
               isRevoking={revokeAttempt.status === 'processing'}
               confirmRevokeId={confirmRevokeId}
+              restoringRequestId={restoringRequestId}
+              isRestoring={restoreAttempt.status === 'processing'}
               onRequestRevoke={id => setConfirmRevokeId(id)}
               onCancelRevoke={() => setConfirmRevokeId('')}
               onConfirmRevoke={onRevoke}
+              onRestore={onRestore}
             />
           ) : (
             approvedAttempt.status === 'processing' && (
@@ -806,17 +829,23 @@ function ActiveGrantsTable({
   revokingRequestId,
   isRevoking,
   confirmRevokeId,
+  restoringRequestId,
+  isRestoring,
   onRequestRevoke,
   onCancelRevoke,
   onConfirmRevoke,
+  onRestore,
 }: {
   items: AccessRequest[];
   revokingRequestId: string;
   isRevoking: boolean;
   confirmRevokeId: string;
+  restoringRequestId: string;
+  isRestoring: boolean;
   onRequestRevoke(id: string): void;
   onCancelRevoke(): void;
   onConfirmRevoke(id: string): void;
+  onRestore(id: string): void;
 }) {
   return (
     <Table<AccessRequest>
@@ -864,7 +893,18 @@ function ActiveGrantsTable({
           headerText: 'Action',
           render: req => {
             if (req.revoked) {
-              return <Cell />;
+              const restoring = isRestoring && restoringRequestId === req.id;
+              return (
+                <Cell>
+                  <ButtonSecondary
+                    size="small"
+                    disabled={isRestoring}
+                    onClick={() => onRestore(req.id)}
+                  >
+                    {restoring ? 'Restoring...' : 'Restore'}
+                  </ButtonSecondary>
+                </Cell>
+              );
             }
             const confirming = confirmRevokeId === req.id;
             const busy = isRevoking && revokingRequestId === req.id;

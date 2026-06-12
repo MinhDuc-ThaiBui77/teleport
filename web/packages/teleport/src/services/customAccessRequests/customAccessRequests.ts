@@ -150,3 +150,13 @@ export function revokeCustomAccessRequest(
     .post(cfg.getAccessRequestsCustomRevokeUrl(clusterId, requestId), {})
     .then(makeAccessRequest);
 }
+
+// restoreCustomAccessRequest removes the revoke lock, restoring the grant.
+export function restoreCustomAccessRequest(
+  clusterId: string,
+  requestId: string
+): Promise<void> {
+  return api
+    .post(cfg.getAccessRequestsCustomRestoreUrl(clusterId, requestId), {})
+    .then(() => undefined);
+}
