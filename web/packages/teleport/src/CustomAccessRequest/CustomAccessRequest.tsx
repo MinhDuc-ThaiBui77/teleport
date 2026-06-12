@@ -493,6 +493,10 @@ export function CustomAccessRequest() {
   );
 }
 
+// NOTE: DataTable's match() drops every row when searchableProps is empty,
+// which is the case when all columns use altKey (custom renders). We pass
+// searchableProps with always-present fields so all rows stay visible — there
+// is no search box, this only keeps the filter from hiding everything.
 function RequestsTable({
   items,
   activeRequestId,
@@ -510,6 +514,7 @@ function RequestsTable({
     <Table<AccessRequest>
       data={items}
       emptyText="No requests yet. Select a server above and submit a request."
+      searchableProps={['state', 'user']}
       row={{ getKey: r => r.id }}
       pagination={{ pageSize: 10 }}
       columns={[
@@ -619,6 +624,7 @@ function PendingApprovalsTable({
     <Table<AccessRequest>
       data={items}
       emptyText="No pending approvals. Requests awaiting your review appear here."
+      searchableProps={['state', 'user']}
       row={{ getKey: r => r.id }}
       pagination={{ pageSize: 10 }}
       columns={[
