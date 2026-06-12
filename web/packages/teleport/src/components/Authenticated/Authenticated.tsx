@@ -66,7 +66,19 @@ const Authenticated: React.FC<PropsWithChildren> = ({ children }) => {
 
       // Prefetch user context and preferences. We do this here to speed up the initial load by fetching them concurrently.
       userService.fetchUserContext().catch(err => {
-        // We merely log any error here, however if this fails, the actual UserContext component will attempt again and handle errors and show the error banner.
+        // A 403 here means the session can't even load the user's own context
+        // (e.g. it was locked / a JIT grant was revoked). Treat it like an
+        // invalid session and send them to login instead of leaving them stuck
+        // on "access denied". We key on the 403 status because the lock-in-force
+        // marker is stripped at the gRPC boundary and the message can collapse
+        // to a generic "access denied".
+        if (err instanceof ApiError && err.response?.status === 403) {
+          logger.warn('user context forbidden — session likely locked');
+          stashAppLauncherFragmentIfPresent();
+          session.clearBrowserSession(true /* rememberLocation */);
+          return;
+        }
+        // We merely log any other error here; the actual UserContext component will attempt again and handle errors and show the error banner.
         logger.error('Failed to prefetch user context', err);
       });
       getUserPreferences().catch(err => {

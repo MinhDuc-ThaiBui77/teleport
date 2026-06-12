@@ -30,13 +30,26 @@ Community-safe auth client methods used:
 - `SetAccessRequestState`
 - `UpsertLock` / `GetLocks` / `DeleteLock` (revoke / restore a grant — see below)
 
-### Revoking an active grant (without locking the user)
+### Revoking ("End session") — a coarse kill-switch, NOT a surgical revoke
 
-Revoke creates a **lock targeting the access request** (`LockTarget.AccessRequest
-= <request id>`), via `UpsertLock`. This drops only the elevated access that
-request granted — the user's normal access is untouched and they are NOT locked
-out as a user. The lock's `Expires` is set to the request's own access expiry so
-it **self-cleans** (no permanent lock garbage); re-access is a brand-new request.
+IMPORTANT — Teleport OSS limitation: you **cannot** revoke a single server from a
+user's live session. The elevated cert is one block; locking the request (or any
+identity target) matches the whole session. So "End session" creates a **lock
+targeting the access request** (`LockTarget.AccessRequest = <id>`, via
+`UpsertLock`) that **terminates the user's entire current elevated session** —
+all their JIT-granted access, not just that one server. It does NOT permanently
+lock the user account: they are bounced to login and log back in to their **base**
+access, then re-request whatever they still need (the locked request can't be
+re-assumed). The lock's `Expires` = the request's access expiry so it
+**self-cleans**. The UI is labelled accordingly ("End session" + a warning).
+
+Because a locked session 403s every request — and the lock-in-force marker is
+stripped at the gRPC boundary (`api/trail.ToGRPC` uses `UserMessage`, dropping
+trace `Fields`) — the web can't reliably read the lock marker. So
+`Authenticated.tsx` treats a **403 on the page-load userContext fetch** as an
+invalid session and redirects to login (mirroring its existing
+`validateCookieAndSession` 403 handling), which reliably un-sticks the user on
+reload. (`api.ts` also keeps a best-effort lock-in-force message check.)
 Locks are OSS (the web API already exposes `createClusterLock`). Approvers need
 `lock` `create`/`list`/`read`/`delete` RBAC — added to the `ssh-approver` role
 (`delete` is for Restore). Note: deleting a request does NOT revoke an

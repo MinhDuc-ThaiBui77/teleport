@@ -570,6 +570,13 @@ export function CustomAccessRequest() {
             </ButtonSecondary>
           </Flex>
 
+          <Text color="warning.main" fontSize={1} mb={2}>
+            Note: this ENDS the user's entire current elevated session (all their
+            JIT-granted access, not just this one server) — Teleport cannot revoke
+            a single server from a live session. The user is sent back to login
+            and keeps their base access; they re-request what they still need.
+          </Text>
+
           {approvedAttempt.status === 'error' && !approvedItems && (
             <Danger>{approvedAttempt.statusText}</Danger>
           )}
@@ -912,13 +919,13 @@ function ActiveGrantsTable({
               <Cell>
                 {confirming ? (
                   <Flex gap={2} alignItems="center">
-                    <Text fontSize={1}>Revoke access?</Text>
+                    <Text fontSize={1}>End this user's session?</Text>
                     <ButtonSecondary
                       size="small"
                       disabled={isRevoking}
                       onClick={() => onConfirmRevoke(req.id)}
                     >
-                      {busy ? 'Revoking...' : 'Confirm'}
+                      {busy ? 'Ending...' : 'Confirm'}
                     </ButtonSecondary>
                     <ButtonSecondary size="small" onClick={onCancelRevoke}>
                       Cancel
@@ -930,7 +937,7 @@ function ActiveGrantsTable({
                     disabled={isRevoking}
                     onClick={() => onRequestRevoke(req.id)}
                   >
-                    Revoke access
+                    End session
                   </ButtonSecondary>
                 )}
               </Cell>
