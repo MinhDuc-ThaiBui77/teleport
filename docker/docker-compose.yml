@@ -1,0 +1,37 @@
+# All-in-one (auth + proxy + custom Access GUI) deployment.
+# Usage:
+#   TELEPORT_TAG=$(git rev-parse --short HEAD) docker compose up -d
+#
+# OSS uses the SQLite backend -> exactly ONE auth container per data volume.
+# Do not scale this service to >1 replica (that needs etcd/dynamo).
+
+services:
+  teleport:
+    image: teleport-custom:${TELEPORT_TAG:-latest}
+    container_name: teleport
+    restart: unless-stopped
+
+    # Host networking is the simplest for an all-in-one auth+proxy that other
+    # Teleport node agents dial back into via reverse tunnel (port 3024).
+    # If you prefer bridged networking, delete this line and uncomment `ports:`.
+    network_mode: host
+
+    volumes:
+      # Cluster CA + ALL state. Losing this = losing the cluster identity.
+      - teleport-data:/var/lib/teleport
+      # Reuse the working config from 10.120.10.35 (copy it here as teleport.yaml).
+      - ./teleport.yaml:/etc/teleport/teleport.yaml:ro
+      # Uncomment if you serve the GUI with your own TLS cert files:
+      # - ./certs:/etc/teleport/certs:ro
+
+    # ports:                # only when NOT using network_mode: host
+    #   - "3080:3080"       # web UI / proxy HTTPS (the GUI)
+    #   - "3023:3023"       # proxy SSH (tsh ssh)
+    #   - "3024:3024"       # proxy reverse tunnel (nodes dial in)
+    #   - "3025:3025"       # auth
+    #   - "3022:3022"       # node SSH (only if this container is also a node)
+
+    stop_grace_period: 30s
+
+volumes:
+  teleport-data:

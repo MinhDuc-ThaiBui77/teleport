@@ -1,0 +1,40 @@
+# Production config for a FRESH cluster (new CA generated on first start).
+# Copy this to ./teleport.yaml and edit the CHANGE-ME / cluster_name values.
+#
+# All-in-one OSS: auth + proxy + (optional) node, SQLite backend.
+
+version: v3
+teleport:
+  nodename: teleport-prod
+  data_dir: /var/lib/teleport          # MUST match the volume mount
+  log:
+    output: stderr
+    severity: INFO
+
+auth_service:
+  enabled: true
+  cluster_name: corp                   # set ONCE; never change after first start
+  listen_addr: 0.0.0.0:3025
+  # OSS default backend is sqlite under data_dir — nothing to configure.
+
+proxy_service:
+  enabled: true
+  web_listen_addr: 0.0.0.0:3080        # the GUI is served here
+  # The address users/nodes use to REACH this proxy.
+  # CHANGE THIS to the prod machine's DNS name or IP (reachable by browsers AND
+  # node agents). Example: teleport.corp.local:3080  or  10.0.0.20:3080
+  public_addr: CHANGE-ME.corp.local:3080
+  # TLS for the web UI. Pick ONE:
+  #   (a) bring your own cert files:
+  # https_keypairs:
+  #   - key_file: /etc/teleport/certs/key.pem
+  #     cert_file: /etc/teleport/certs/cert.pem
+  #   (b) or let Teleport get a Let's Encrypt cert (needs a public DNS name + 443):
+  # acme:
+  #   enabled: true
+  #   email: ops@corp.example
+
+ssh_service:
+  # Enable ONLY if this container should itself be an SSH target.
+  # The real servers (elastic-02/03 ...) run their own `teleport` node agents.
+  enabled: false
